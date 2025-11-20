@@ -6,7 +6,7 @@ import json
 import asyncio
 from datetime import datetime, timedelta
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters
+from telegram.ext import Application, MessageHandler, CommandHandler, filters
 
 
 # Хранилище контекста (в памяти)
@@ -441,6 +441,24 @@ async def show_context_command(update: Update, context):
     await update.message.reply_text(context_text)
 
 
+async def reload_config_command(update: Update, context):
+    """Команда для показа текущего контекста (для отладки)"""
+    try:
+        user = update.message.from_user
+        if user is None:
+            return
+
+        global config
+
+        if user.username not in config.get('allowed_private_users'):
+            return
+
+        config = load_config()  # Перезагружаем конфиг
+        await update.message.reply_text("✅ Конфигурация перезагружена!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+
+
 async def handle_group_message_advanced(update: Update, context):
     """Расширенная обработка с детальным анализом цитируемых сообщений"""
     if update.message is None:
@@ -569,7 +587,7 @@ def main():
     # ))
 
     application.add_handler(MessageHandler(
-        filters.TEXT & filters.ChatType.PRIVATE,
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
         handle_private_message
     ))
 
@@ -583,6 +601,8 @@ def main():
         filters.Regex(r'^/show_context$') & filters.ChatType.PRIVATE,
         show_context_command
     ))
+
+    application.add_handler(CommandHandler("reload_config", reload_config_command))
 
     print("Бот запущен с поддержкой контекста!")
     application.run_polling()
