@@ -2,7 +2,6 @@ import yaml
 import random
 import re
 import requests
-import json
 import asyncio
 from datetime import datetime, timedelta
 from telegram import Update
@@ -105,7 +104,7 @@ async def make_async_request(url, headers, data):
         raise e
 
 
-async def get_ai_response_with_context(message_text, config, bot_username, chat_id, user_name=""):
+async def get_ai_response_with_context(message_text, bot_username, chat_id, user_name=""):
     """Получает ответ от нейросети с учетом контекста"""
     ai_config = config.get('ai', {})
     provider = ai_config.get('provider', 'deepseek')
@@ -124,12 +123,12 @@ async def get_ai_response_with_context(message_text, config, bot_username, chat_
 
     # Формируем промпт с контекстом
     if provider in ['deepseek', 'yandexgpt', 'gigachat']:
-        return await get_modern_ai_response(context_messages, ai_config, provider)
+        return await get_modern_ai_response(context_messages, provider)
     else:
-        return await get_legacy_ai_response(context_messages, message_text, ai_config, provider)
+        return await get_legacy_ai_response(context_messages, message_text, provider)
 
 
-async def get_modern_ai_response(context_messages, config, provider):
+async def get_modern_ai_response(context_messages, provider):
     """Для современных API, поддерживающих историю сообщений"""
     try:
         system_prompt = config.get('system_prompt', 'Ты полезный ассистент. Отвечай на русском.')
@@ -145,17 +144,17 @@ async def get_modern_ai_response(context_messages, config, provider):
             })
 
         if provider == 'deepseek':
-            return await get_deepseek_response(messages, config)
+            return await get_deepseek_response(messages)
         elif provider == 'yandexgpt':
-            return await get_yandexgpt_response(messages, config)
+            return await get_yandexgpt_response(messages)
         elif provider == 'gigachat':
-            return await get_gigachat_response(messages, config)
+            return await get_gigachat_response(messages)
 
     except Exception as e:
         return f"Ошибка при обработке контекста: {str(e)}"
 
 
-async def get_legacy_ai_response(context_messages, message_text, config, provider):
+async def get_legacy_ai_response(context_messages, message_text, provider):
     """Для API, которые не поддерживают историю сообщений"""
     # Собираем контекст в один текст
     context_text = ""
@@ -166,12 +165,12 @@ async def get_legacy_ai_response(context_messages, message_text, config, provide
     full_prompt = f"Контекст диалога:\n{context_text}\nТекущее сообщение: {message_text}\nОтвет:"
 
     if provider == 'llama':
-        return await get_llama_response(full_prompt, config)
+        return await get_llama_response(full_prompt)
     else:
-        return await get_deepseek_response([{"role": "user", "content": full_prompt}], config)
+        return await get_deepseek_response([{"role": "user", "content": full_prompt}])
 
 
-async def get_llama_response(prompt, config):
+async def get_llama_response(prompt):
     """Llama API с поддержкой локальных моделей"""
     try:
         # Получаем конфигурацию для Llama
@@ -222,7 +221,7 @@ async def get_llama_response(prompt, config):
         return f"Ошибка при запросе к Llama: {str(e)}"
 
 
-async def get_deepseek_response(messages, config):
+async def get_deepseek_response(messages):
     """DeepSeek API с поддержкой контекста"""
     try:
         api_key = config.get('deepseek_api_key')
@@ -259,7 +258,7 @@ async def get_deepseek_response(messages, config):
         return f"Ошибка при запросе к DeepSeek: {str(e)}"
 
 
-async def get_yandexgpt_response(messages, config):
+async def get_yandexgpt_response(messages):
     """Yandex GPT API"""
     try:
         api_key = config.get('api_key')
@@ -295,7 +294,7 @@ async def get_yandexgpt_response(messages, config):
         return f"Ошибка при запросе к Yandex GPT: {str(e)}"
 
 
-async def get_gigachat_response(messages, config):
+async def get_gigachat_response(messages):
     """GigaChat API с поддержкой контекста"""
     try:
         # Получаем конфигурацию для GigaChat
@@ -365,7 +364,6 @@ async def handle_group_message(update: Update, context):
             # Получаем ответ с учетом контекста
             ai_response = await get_ai_response_with_context(
                 update.message.text,
-                config,
                 bot_username,
                 chat_id,
                 user_name=user.first_name
@@ -400,7 +398,6 @@ async def handle_private_message(update: Update, context):
         if use_ai:
             ai_response = await get_ai_response_with_context(
                 update.message.text,
-                config,
                 bot_username,
                 chat_id,
                 user_name=user.first_name
@@ -500,7 +497,6 @@ async def handle_group_message_advanced(update: Update, context):
 
             ai_response = await get_ai_response_with_context(
                 enhanced_message,
-                config,
                 bot_username,
                 chat_id,
                 user_name=user.first_name
