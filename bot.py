@@ -123,12 +123,12 @@ async def get_ai_response_with_context(message_text, bot_username, chat_id, user
 
     # Формируем промпт с контекстом
     if provider in ['deepseek', 'yandexgpt', 'gigachat']:
-        return await get_modern_ai_response(context_messages, provider)
+        return await get_modern_ai_response(ai_config, context_messages, provider)
     else:
-        return await get_legacy_ai_response(context_messages, message_text, provider)
+        return await get_legacy_ai_response(ai_config, context_messages, message_text, provider)
 
 
-async def get_modern_ai_response(context_messages, provider):
+async def get_modern_ai_response(ai_config, context_messages, provider):
     """Для современных API, поддерживающих историю сообщений"""
     try:
         system_prompt = config.get('system_prompt', 'Ты полезный ассистент. Отвечай на русском.')
@@ -144,17 +144,17 @@ async def get_modern_ai_response(context_messages, provider):
             })
 
         if provider == 'deepseek':
-            return await get_deepseek_response(messages)
+            return await get_deepseek_response(ai_config, messages)
         elif provider == 'yandexgpt':
-            return await get_yandexgpt_response(messages)
+            return await get_yandexgpt_response(ai_config, messages)
         elif provider == 'gigachat':
-            return await get_gigachat_response(messages)
+            return await get_gigachat_response(ai_config, messages)
 
     except Exception as e:
         return f"Ошибка при обработке контекста: {str(e)}"
 
 
-async def get_legacy_ai_response(context_messages, message_text, provider):
+async def get_legacy_ai_response(ai_config, context_messages, message_text, provider):
     """Для API, которые не поддерживают историю сообщений"""
     # Собираем контекст в один текст
     context_text = ""
@@ -165,17 +165,17 @@ async def get_legacy_ai_response(context_messages, message_text, provider):
     full_prompt = f"Контекст диалога:\n{context_text}\nТекущее сообщение: {message_text}\nОтвет:"
 
     if provider == 'llama':
-        return await get_llama_response(full_prompt)
+        return await get_llama_response(ai_config, full_prompt)
     else:
-        return await get_deepseek_response([{"role": "user", "content": full_prompt}])
+        return await get_deepseek_response(ai_config, [{"role": "user", "content": full_prompt}])
 
 
-async def get_llama_response(prompt):
+async def get_llama_response(ai_config, prompt):
     """Llama API с поддержкой локальных моделей"""
     try:
         # Получаем конфигурацию для Llama
-        api_base = config.get('llama_api_base', 'http://localhost:11434')
-        model = config.get('llama_model', 'llama2')
+        api_base = ai_config.get('llama_api_base', 'http://localhost:11434')
+        model = ai_config.get('llama_model', 'llama2')
 
         # Формируем URL для API
         url = f"{api_base}/api/chat" if api_base.endswith('/api/chat') else f"{api_base}/api/chat"
@@ -221,10 +221,10 @@ async def get_llama_response(prompt):
         return f"Ошибка при запросе к Llama: {str(e)}"
 
 
-async def get_deepseek_response(messages):
+async def get_deepseek_response(ai_config, messages):
     """DeepSeek API с поддержкой контекста"""
     try:
-        api_key = config.get('deepseek_api_key')
+        api_key = ai_config.get('deepseek_api_key')
         if not api_key:
             return "API ключ для DeepSeek не настроен"
 
@@ -258,11 +258,11 @@ async def get_deepseek_response(messages):
         return f"Ошибка при запросе к DeepSeek: {str(e)}"
 
 
-async def get_yandexgpt_response(messages):
+async def get_yandexgpt_response(ai_config, messages):
     """Yandex GPT API"""
     try:
-        api_key = config.get('api_key')
-        folder_id = config.get('folder_id')
+        api_key = ai_config.get('api_key')
+        folder_id = ai_config.get('folder_id')
 
         if not api_key or not folder_id:
             return "Не настроен API ключ или folder_id для Yandex GPT"
@@ -294,11 +294,11 @@ async def get_yandexgpt_response(messages):
         return f"Ошибка при запросе к Yandex GPT: {str(e)}"
 
 
-async def get_gigachat_response(messages):
+async def get_gigachat_response(ai_config, messages):
     """GigaChat API с поддержкой контекста"""
     try:
         # Получаем конфигурацию для GigaChat
-        api_key = config.get('gigachat_api_key')
+        api_key = ai_config.get('gigachat_api_key')
         if not api_key:
             return "API ключ для GigaChat не настроен"
 
