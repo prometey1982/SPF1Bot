@@ -131,7 +131,7 @@ async def get_ai_response_with_context(message_text, bot_username, chat_id, user
 async def get_modern_ai_response(ai_config, context_messages, provider):
     """Для современных API, поддерживающих историю сообщений"""
     try:
-        system_prompt = config.get('system_prompt', 'Ты полезный ассистент. Отвечай на русском.')
+        system_prompt = ai_config.get('system_prompt', 'Ты полезный ассистент. Отвечай на русском.')
 
         # Формируем messages для API
         messages = [{"role": "system", "content": system_prompt}]
