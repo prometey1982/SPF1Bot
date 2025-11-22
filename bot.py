@@ -372,13 +372,13 @@ async def handle_group_message(update: Update, context):
             # Добавляем ответ бота в контекст
             chat_context.add_message(chat_id, "assistant", ai_response)
 
-            await update.message.reply_text(ai_response)
+            await update.message.reply_text(ai_response, parse_mode='Markdown')
             print(f"AI ответ: {ai_response}")
         else:
             responses = config.get('responses', [])
             if responses:
                 response = random.choice(responses)
-                await update.message.reply_text(response)
+                await update.message.reply_text(response, parse_mode='Markdown')
     print("---")
 
 
@@ -406,19 +406,19 @@ async def handle_private_message(update: Update, context):
             # Добавляем ответ бота в контекст
             chat_context.add_message(chat_id, "assistant", ai_response)
 
-            await update.message.reply_text(ai_response)
+            await update.message.reply_text(ai_response, parse_mode='Markdown')
         else:
             responses = config.get('responses', [])
             if responses:
                 response = random.choice(responses)
-                await update.message.reply_text(response)
+                await update.message.reply_text(response, parse_mode='Markdown')
 
 
 async def clear_context_command(update: Update, context):
     """Команда для очистки контекста"""
     chat_id = update.message.chat_id
     chat_context.clear_context(chat_id)
-    await update.message.reply_text("Контекст диалога очищен!")
+    await update.message.reply_text("Контекст диалога очищен!", parse_mode='Markdown')
 
 
 async def show_context_command(update: Update, context):
@@ -427,7 +427,7 @@ async def show_context_command(update: Update, context):
     context_messages = chat_context.get_context(chat_id)
 
     if not context_messages:
-        await update.message.reply_text("Контекст пуст")
+        await update.message.reply_text("Контекст пуст", parse_mode='Markdown')
         return
 
     context_text = "Текущий контекст:\n\n"
@@ -435,7 +435,7 @@ async def show_context_command(update: Update, context):
         role = "👤" if msg["role"] == "user" else "🤖"
         context_text += f"{role} {msg['content'][:100]}...\n"
 
-    await update.message.reply_text(context_text)
+    await update.message.reply_text(context_text, parse_mode='Markdown')
 
 
 async def reload_config_command(update: Update, context):
@@ -451,9 +451,9 @@ async def reload_config_command(update: Update, context):
             return
 
         config = load_config()  # Перезагружаем конфиг
-        await update.message.reply_text("✅ Конфигурация перезагружена!")
+        await update.message.reply_text("✅ Конфигурация перезагружена!", parse_mode='Markdown')
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}", parse_mode='Markdown')
 
 
 async def handle_group_message_advanced(update: Update, context):
@@ -503,13 +503,13 @@ async def handle_group_message_advanced(update: Update, context):
             )
 
             chat_context.add_message(chat_id, "assistant", ai_response)
-            await update.message.reply_text(ai_response)
+            await update.message.reply_text(ai_response, parse_mode='Markdown')
 
         else:
             responses = config.get('responses', [])
             if responses:
                 response = random.choice(responses)
-                await update.message.reply_text(response)
+                await update.message.reply_text(response, parse_mode='Markdown')
 
 
 async def analyze_quoted_message(quoted_message):
