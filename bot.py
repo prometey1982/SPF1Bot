@@ -352,6 +352,7 @@ async def handle_group_message(update: Update, context):
     )
 
     print(f"Группа: {update.message.chat.title}")
+    print(f"Чат: {chat_id}")
     print(f"От: {user.first_name} (ID: {user.id})")
     print(f"Упоминание: {mentioned}, Ответ боту: {replied_to_bot}")
 
@@ -372,11 +373,12 @@ async def handle_group_message(update: Update, context):
             # Добавляем ответ бота в контекст
             chat_context.add_message(chat_id, "assistant", ai_response)
 
-            await update.message.reply_text(ai_response, parse_mode='Markdown')
-            print(f"AI ответ: {ai_response}")
+            if chat_id in config.allowed_group_chat_ids:
+                await update.message.reply_text(ai_response, parse_mode='Markdown')
+                print(f"AI ответ: {ai_response}")
         else:
             responses = config.get('responses', [])
-            if responses:
+            if responses and chat_id in config.allowed_group_chat_ids:
                 response = random.choice(responses)
                 await update.message.reply_text(response, parse_mode='Markdown')
     print("---")
