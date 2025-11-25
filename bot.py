@@ -471,6 +471,9 @@ async def handle_group_message_advanced(update: Update, context):
     bot_username = context.bot.username
     chat_id = update.message.chat_id
 
+    if chat_id is None:
+        return
+
     # Анализ цитируемого сообщения
     quoted_info = await analyze_quoted_message(update.message.reply_to_message)
 
@@ -481,6 +484,8 @@ async def handle_group_message_advanced(update: Update, context):
     )
 
     print(f"Группа: {update.message.chat.title}")
+    print(f"Чат: {chat_id}")
+    print(f"Message thread id: {update.message.message_thread_id}")
     print(f"От: {user.first_name} (ID: {user.id})")
     print(f"Цитирование: {quoted_info}")
 
@@ -505,7 +510,8 @@ async def handle_group_message_advanced(update: Update, context):
             )
 
             chat_context.add_message(chat_id, "assistant", ai_response)
-            await update.message.reply_text(ai_response, parse_mode='Markdown')
+            if update.message.message_thread_id in config.get('allowed_group_chat_ids'):
+                await update.message.reply_text(ai_response, parse_mode='Markdown')
 
         else:
             responses = config.get('responses', [])
