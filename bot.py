@@ -8,6 +8,104 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
 
 
+async def send_long_message(update, message_text, parse_mode='Markdown'):
+    """
+    Асинхронная отправка длинного сообщения с учетом ограничений:
+    - длина одного сообщения не может превышать 4 кб
+    - между сообщениями должно пройти не меньше 1 секунды
+    """
+    # Максимальная длина сообщения в байтах
+    MAX_MESSAGE_LENGTH = 4096
+    
+    # Если сообщение помещается в одно сообщение, отправляем его как есть
+    if len(message_text.encode('utf-8')) <= MAX_MESSAGE_LENGTH:
+        # Проверяем, есть ли message_thread_id (для супергрупп и тем обсуждений)
+        message_thread_id = getattr(update.message, 'message_thread_id', None)
+        if message_thread_id:
+            await update.message.reply_text(message_text, parse_mode=parse_mode, message_thread_id=message_thread_id)
+        else:
+            await update.message.reply_text(message_text, parse_mode=parse_mode)
+        return
+    
+    # Разбиваем текст на части
+    parts = []
+    current_part = ""
+    
+    # Разбиваем по строкам, чтобы не разрывать слова
+    lines = message_text.split('\n')
+    
+    for line in lines:
+        # Проверяем, поместится ли следующая строка в текущую часть
+        test_part = current_part + '\n' + line if current_part else line
+        
+        if len(test_part.encode('utf-8')) <= MAX_MESSAGE_LENGTH:
+            current_part = test_part
+        else:
+            # Если текущая строка сама по себе превышает лимит, разбиваем её
+            if len(line.encode('utf-8')) > MAX_MESSAGE_LENGTH:
+                # Разбиваем длинную строку на части
+                if current_part:
+                    parts.append(current_part)
+                    current_part = ""
+                
+                # Разбиваем строку на части по словам
+                words = line.split(' ')
+                temp_line = ""
+                
+                for word in words:
+                    test_line = temp_line + ' ' + word if temp_line else word
+                    if len(test_line.encode('utf-8')) <= MAX_MESSAGE_LENGTH:
+                        temp_line = test_line
+                    else:
+                        if temp_line:
+                            parts.append(temp_line)
+                            temp_line = word
+                        else:
+                            # Если слово само по себе слишком длинное, разбиваем его
+                            if len(word.encode('utf-8')) > MAX_MESSAGE_LENGTH:
+                                # Разбиваем слово посимвольно
+                                char_chunks = []
+                                current_chunk = ""
+                                for char in word:
+                                    test_chunk = current_chunk + char
+                                    if len(test_chunk.encode('utf-8')) <= MAX_MESSAGE_LENGTH:
+                                        current_chunk = test_chunk
+                                    else:
+                                        if current_chunk:
+                                            char_chunks.append(current_chunk)
+                                        current_chunk = char
+                                if current_chunk:
+                                    char_chunks.append(current_chunk)
+                                
+                                parts.extend(char_chunks)
+                            else:
+                                temp_line = word
+                if temp_line:
+                    current_part = temp_line
+            else:
+                # Сохраняем текущую часть и начинаем новую
+                if current_part:
+                    parts.append(current_part)
+                current_part = line
+    
+    # Добавляем последнюю часть
+    if current_part:
+        parts.append(current_part)
+    
+    # Отправляем все части с задержкой
+    for i, part in enumerate(parts):
+        # Проверяем, есть ли message_thread_id (для супергрупп и тем обсуждений)
+        message_thread_id = getattr(update.message, 'message_thread_id', None)
+        if message_thread_id:
+            await update.message.reply_text(part, parse_mode=parse_mode, message_thread_id=message_thread_id)
+        else:
+            await update.message.reply_text(part, parse_mode=parse_mode)
+        
+        # Не делаем задержку после последнего сообщения
+        if i < len(parts) - 1:
+            await asyncio.sleep(1)
+
+
 # Хранилище контекста (в памяти)
 class ChatContext:
     def __init__(self, max_context_length=10, ttl_hours=24):
@@ -374,13 +472,13 @@ async def handle_group_message(update: Update, context):
             chat_context.add_message(chat_id, "assistant", ai_response)
 
             if chat_id in config.allowed_group_chat_ids:
-                await update.message.reply_text(ai_response, parse_mode='Markdown')
+                await send_long_message(update, ai_response, parse_mode='Markdown')
                 print(f"AI ответ: {ai_response}")
         else:
             responses = config.get('responses', [])
             if responses and chat_id in config.allowed_group_chat_ids:
                 response = random.choice(responses)
-                await update.message.reply_text(response, parse_mode='Markdown')
+                await send_long_message(update, response, parse_mode='Markdown')
     print("---")
 
 
@@ -408,19 +506,19 @@ async def handle_private_message(update: Update, context):
             # Добавляем ответ бота в контекст
             chat_context.add_message(chat_id, "assistant", ai_response)
 
-            await update.message.reply_text(ai_response, parse_mode='Markdown')
+            await send_long_message(update, ai_response, parse_mode='Markdown')
         else:
             responses = config.get('responses', [])
             if responses:
                 response = random.choice(responses)
-                await update.message.reply_text(response, parse_mode='Markdown')
+                await send_long_message(update, response, parse_mode='Markdown')
 
 
 async def clear_context_command(update: Update, context):
     """Команда для очистки контекста"""
     chat_id = update.message.chat_id
     chat_context.clear_context(chat_id)
-    await update.message.reply_text("Контекст диалога очищен!", parse_mode='Markdown')
+    await send_long_message(update, "Контекст диалога очищен!", parse_mode='Markdown')
 
 
 async def show_context_command(update: Update, context):
@@ -429,7 +527,7 @@ async def show_context_command(update: Update, context):
     context_messages = chat_context.get_context(chat_id)
 
     if not context_messages:
-        await update.message.reply_text("Контекст пуст", parse_mode='Markdown')
+        await send_long_message(update, "Контекст пуст", parse_mode='Markdown')
         return
 
     context_text = "Текущий контекст:\n\n"
@@ -437,7 +535,7 @@ async def show_context_command(update: Update, context):
         role = "👤" if msg["role"] == "user" else "🤖"
         context_text += f"{role} {msg['content'][:100]}...\n"
 
-    await update.message.reply_text(context_text, parse_mode='Markdown')
+    await send_long_message(update, context_text, parse_mode='Markdown')
 
 
 async def reload_config_command(update: Update, context):
@@ -453,9 +551,9 @@ async def reload_config_command(update: Update, context):
             return
 
         config = load_config()  # Перезагружаем конфиг
-        await update.message.reply_text("✅ Конфигурация перезагружена!", parse_mode='Markdown')
+        await send_long_message(update, "✅ Конфигурация перезагружена!", parse_mode='Markdown')
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {str(e)}", parse_mode='Markdown')
+        await send_long_message(update, f"❌ Ошибка: {str(e)}", parse_mode='Markdown')
 
 
 async def handle_group_message_advanced(update: Update, context):
@@ -510,14 +608,14 @@ async def handle_group_message_advanced(update: Update, context):
             )
 
             chat_context.add_message(chat_id, "assistant", ai_response)
-            if update.message.message_thread_id in config.get('allowed_group_chat_ids'):
-                await update.message.reply_text(ai_response, parse_mode='Markdown')
+            if chat_id in config.get('allowed_group_chat_ids', []):
+                await send_long_message(update, ai_response, parse_mode='Markdown')
 
         else:
             responses = config.get('responses', [])
             if responses:
                 response = random.choice(responses)
-                await update.message.reply_text(response, parse_mode='Markdown')
+                await send_long_message(update, response, parse_mode='Markdown')
 
 
 async def analyze_quoted_message(quoted_message):
