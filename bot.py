@@ -519,6 +519,7 @@ async def handle_group_message_advanced(update: Update, context):
 
     bot_username = context.bot.username
     chat_id = update.message.chat_id
+    message_thread_id = update.message.message_thread_id
 
     if chat_id is None:
         return
@@ -534,7 +535,7 @@ async def handle_group_message_advanced(update: Update, context):
 
     print(f"Группа: {update.message.chat.title}")
     print(f"Чат: {chat_id}")
-    print(f"Message thread id: {update.message.message_thread_id}")
+    print(f"Message thread id: {message_thread_id}")
     print(f"От: {user.first_name} (ID: {user.id})")
     print(f"Цитирование: {quoted_info}")
 
@@ -559,7 +560,7 @@ async def handle_group_message_advanced(update: Update, context):
             )
 
             chat_context.add_message(chat_id, "assistant", ai_response)
-            if chat_id in config.get('allowed_group_chat_ids', []):
+            if message_thread_id in config.get('allowed_group_chat_ids', []):
                 await send_long_message(update, ai_response, parse_mode='Markdown')
 
         else:
