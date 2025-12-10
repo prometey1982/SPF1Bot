@@ -8,6 +8,30 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
 
 
+def split_text(text: str, max_length: int = 4096) -> list[str]:
+    """
+    Разбивает текст на части длиной не более max_length,
+    стараясь не разрывать слова.
+    """
+    if not text:
+        return []
+
+    parts = []
+    while len(text) > max_length:
+        # Ищем место для разреза: сначала по переносу строки, потом по пробелу
+        split_pos = text.rfind('\n', 0, max_length)
+        if split_pos == -1:
+            split_pos = text.rfind(' ', 0, max_length)
+        if split_pos == -1:
+            # Если ни переноса, ни пробела нет — приходится резать по лимиту
+            split_pos = max_length
+
+        parts.append(text[:split_pos])
+        text = text[split_pos:].lstrip()  # убираем начальные пробелы/переносы
+
+    parts.append(text)
+    return parts
+
 async def send_long_message(update, message_text, parse_mode='Markdown'):
     """
     Асинхронная отправка длинного сообщения с учетом ограничений:
@@ -16,81 +40,8 @@ async def send_long_message(update, message_text, parse_mode='Markdown'):
     """
     # Максимальная длина сообщения в байтах
     MAX_MESSAGE_LENGTH = 4096
-    
-    # Если сообщение помещается в одно сообщение, отправляем его как есть
-    if len(message_text.encode('utf-8')) <= MAX_MESSAGE_LENGTH:
-        # Проверяем, есть ли message_thread_id (для супергрупп и тем обсуждений)
-        message_thread_id = getattr(update.message, 'message_thread_id', None)
-        if message_thread_id:
-            await update.message.reply_text(message_text, parse_mode=parse_mode, message_thread_id=message_thread_id)
-        else:
-            await update.message.reply_text(message_text, parse_mode=parse_mode)
-        return
-    
-    # Разбиваем текст на части
-    parts = []
-    current_part = ""
-    
-    # Разбиваем по строкам, чтобы не разрывать слова
-    lines = message_text.split('\n')
-    
-    for line in lines:
-        # Проверяем, поместится ли следующая строка в текущую часть
-        test_part = current_part + '\n' + line if current_part else line
-        
-        if len(test_part.encode('utf-8')) <= MAX_MESSAGE_LENGTH:
-            current_part = test_part
-        else:
-            # Если текущая строка сама по себе превышает лимит, разбиваем её
-            if len(line.encode('utf-8')) > MAX_MESSAGE_LENGTH:
-                # Разбиваем длинную строку на части
-                if current_part:
-                    parts.append(current_part)
-                    current_part = ""
-                
-                # Разбиваем строку на части по словам
-                words = line.split(' ')
-                temp_line = ""
-                
-                for word in words:
-                    test_line = temp_line + ' ' + word if temp_line else word
-                    if len(test_line.encode('utf-8')) <= MAX_MESSAGE_LENGTH:
-                        temp_line = test_line
-                    else:
-                        if temp_line:
-                            parts.append(temp_line)
-                            temp_line = word
-                        else:
-                            # Если слово само по себе слишком длинное, разбиваем его
-                            if len(word.encode('utf-8')) > MAX_MESSAGE_LENGTH:
-                                # Разбиваем слово посимвольно
-                                char_chunks = []
-                                current_chunk = ""
-                                for char in word:
-                                    test_chunk = current_chunk + char
-                                    if len(test_chunk.encode('utf-8')) <= MAX_MESSAGE_LENGTH:
-                                        current_chunk = test_chunk
-                                    else:
-                                        if current_chunk:
-                                            char_chunks.append(current_chunk)
-                                        current_chunk = char
-                                if current_chunk:
-                                    char_chunks.append(current_chunk)
-                                
-                                parts.extend(char_chunks)
-                            else:
-                                temp_line = word
-                if temp_line:
-                    current_part = temp_line
-            else:
-                # Сохраняем текущую часть и начинаем новую
-                if current_part:
-                    parts.append(current_part)
-                current_part = line
-    
-    # Добавляем последнюю часть
-    if current_part:
-        parts.append(current_part)
+
+    parts = split_text(message_text, MAX_MESSAGE_LENGTH)
     
     # Отправляем все части с задержкой
     for i, part in enumerate(parts):
@@ -103,7 +54,7 @@ async def send_long_message(update, message_text, parse_mode='Markdown'):
         
         # Не делаем задержку после последнего сообщения
         if i < len(parts) - 1:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.05)
 
 
 # Хранилище контекста (в памяти)
