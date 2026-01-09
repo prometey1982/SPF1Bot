@@ -541,7 +541,8 @@ async def handle_group_message_advanced(update: Update, context):
 
     always_respond_to_users = config.get('always_respond_to_users')
 
-    if mentioned or replied_to_bot or user.username in always_respond_to_users:
+    if (mentioned or replied_to_bot or user.username in always_respond_to_users) and message_thread_id in config.get(
+            'allowed_group_chat_ids', []):
         use_ai = config.get('use_ai', False)
 
         if use_ai:
@@ -560,8 +561,7 @@ async def handle_group_message_advanced(update: Update, context):
             )
 
             chat_context.add_message(chat_id, "assistant", ai_response)
-            if message_thread_id in config.get('allowed_group_chat_ids', []):
-                await send_long_message(update, ai_response, parse_mode='Markdown')
+            await send_long_message(update, ai_response, parse_mode='Markdown')
 
         else:
             responses = config.get('responses', [])
