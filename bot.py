@@ -284,7 +284,7 @@ async def get_deepseek_response(ai_config, messages):
         }
 
         data = {
-            "model": "deepseek-chat",
+            "model": "deepseek-reasoner",
             "messages": messages,
             "temperature": 1.3,
             "max_tokens": 2000,
