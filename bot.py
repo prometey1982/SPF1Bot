@@ -3,9 +3,14 @@ import random
 import re
 import requests
 import asyncio
+import sqlite3
+import logging
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
 def split_text(text: str, max_length: int = 4096) -> list[str]:
@@ -47,11 +52,17 @@ async def send_long_message(update, message_text, parse_mode='Markdown'):
     for i, part in enumerate(parts):
         # Проверяем, есть ли message_thread_id (для супергрупп и тем обсуждений)
         message_thread_id = getattr(update.message, 'message_thread_id', None)
-        if message_thread_id:
-            await update.message.reply_text(part, parse_mode=parse_mode, message_thread_id=message_thread_id)
-        else:
-            await update.message.reply_text(part, parse_mode=parse_mode)
-        
+        try:
+            if message_thread_id:
+                await update.message.reply_text(part, parse_mode=parse_mode, message_thread_id=message_thread_id)
+            else:
+                await update.message.reply_text(part, parse_mode=parse_mode)
+        except Exception:
+            if message_thread_id:
+                await update.message.reply_text(part, message_thread_id=message_thread_id)
+            else:
+                await update.message.reply_text(part)
+
         # Не делаем задержку после последнего сообщения
         if i < len(parts) - 1:
             await asyncio.sleep(0.05)
@@ -129,6 +140,133 @@ chat_context = ChatContext(max_context_length=15, ttl_hours=24)
 config = load_config()
 
 
+# --- Database ---
+
+def init_db():
+    db_path = config.get('db', 'bot.db')
+    conn = sqlite3.connect(db_path)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS USER_INFO (
+            id INTEGER PRIMARY KEY,
+            dossier TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+
+def _get_conn():
+    return sqlite3.connect(config.get('db', 'bot.db'))
+
+
+def get_dossier(user_id: int) -> str | None:
+    conn = _get_conn()
+    try:
+        row = conn.execute('SELECT dossier FROM USER_INFO WHERE id = ?', (user_id,)).fetchone()
+        return row[0] if row and row[0] else None
+    finally:
+        conn.close()
+
+
+def save_dossier(user_id: int, dossier: str):
+    conn = _get_conn()
+    try:
+        conn.execute(
+            'INSERT INTO USER_INFO (id, dossier) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET dossier = excluded.dossier',
+            (user_id, dossier)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_dossier(user_id: int):
+    conn = _get_conn()
+    try:
+        conn.execute('DELETE FROM USER_INFO WHERE id = ?', (user_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_all_dossiers():
+    conn = _get_conn()
+    try:
+        conn.execute('DELETE FROM USER_INFO')
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# --- Dossier Manager ---
+
+class DossierManager:
+    def __init__(self):
+        self._queues: dict[int, asyncio.Queue] = {}
+        self._processing: set[int] = set()
+
+    def enqueue(self, user_id: int, message: str):
+        logger.info("Запуск обновления досье для user_id=%d", user_id)
+        if user_id not in self._queues:
+            self._queues[user_id] = asyncio.Queue()
+        self._queues[user_id].put_nowait(message)
+        if user_id not in self._processing:
+            asyncio.create_task(self._process_queue(user_id))
+
+    async def _process_queue(self, user_id: int):
+        self._processing.add(user_id)
+        try:
+            while not self._queues[user_id].empty():
+                messages = []
+                while not self._queues[user_id].empty():
+                    messages.append(self._queues[user_id].get_nowait())
+
+                current_dossier = get_dossier(user_id) or ""
+                dossier_config = config.get('dossier', {})
+                prompt_template = dossier_config.get('update_prompt', '')
+                combined_message = "\n".join(messages)
+                prompt = prompt_template.replace('{dossier}', current_dossier).replace('{message}', combined_message)
+
+                new_dossier = await self._call_with_retries(prompt, dossier_config)
+                if new_dossier:
+                    save_dossier(user_id, new_dossier)
+                    logger.info("Досье обновлено для user_id=%d", user_id)
+        except Exception as e:
+            logger.warning("Ошибка обновления досье для user_id=%d: %s", user_id, e)
+        finally:
+            self._processing.discard(user_id)
+
+    async def _call_with_retries(self, prompt: str, dossier_config: dict) -> str | None:
+        retry_count = dossier_config.get('update_retry_count', 3)
+        backoff = dossier_config.get('backoff', 5)
+        max_backoff = dossier_config.get('max_backoff', 60)
+
+        ai_config = config.get('ai', {})
+        provider = ai_config.get('provider', 'deepseek')
+
+        for attempt in range(retry_count):
+            try:
+                messages = [{"role": "user", "content": prompt}]
+                result = await call_llm_raw(ai_config, messages, provider)
+                if result and not result.startswith("Ошибка"):
+                    return result
+                logger.warning("Попытка %d/%d обновления досье: LLM вернул ошибку: %s", attempt + 1, retry_count, result)
+            except Exception as e:
+                logger.warning("Попытка %d/%d обновления досье не удалась: %s", attempt + 1, retry_count, e)
+
+            if attempt < retry_count - 1:
+                delay = min(backoff * (2 ** attempt), max_backoff)
+                await asyncio.sleep(delay)
+
+        logger.warning("Не удалось обновить досье после %d попыток", retry_count)
+        return None
+
+
+dossier_manager = DossierManager()
+
+init_db()
+
+
 def is_bot_mentioned(text, bot_username):
     """Проверяет, упомянут ли бот в тексте"""
     if not text:
@@ -153,7 +291,21 @@ async def make_async_request(url, headers, data):
         raise e
 
 
-async def get_ai_response_with_context(message_text, bot_username, chat_id, user_name=""):
+async def call_llm_raw(ai_config: dict, messages: list, provider: str) -> str:
+    """Вызывает LLM напрямую с переданными сообщениями."""
+    if provider in ['deepseek', 'yandexgpt', 'gigachat']:
+        if provider == 'deepseek':
+            return await get_deepseek_response(ai_config, messages)
+        elif provider == 'yandexgpt':
+            return await get_yandexgpt_response(ai_config, messages)
+        elif provider == 'gigachat':
+            return await get_gigachat_response(ai_config, messages)
+    else:
+        user_msg = next((m['content'] for m in messages if m['role'] == 'user'), '')
+        return await get_llama_response(ai_config, user_msg)
+
+
+async def get_ai_response_with_context(message_text, bot_username, chat_id, user_name="", user_id=None):
     """Получает ответ от нейросети с учетом контекста"""
     ai_config = config.get('ai', {})
     provider = ai_config.get('provider', 'deepseek')
@@ -169,6 +321,18 @@ async def get_ai_response_with_context(message_text, bot_username, chat_id, user
 
     # Получаем историю диалога
     context_messages = chat_context.get_context(chat_id)
+
+    # Инжектим досье в контекст, если есть
+    if user_id and config.get('use_ai', False):
+        dossier = get_dossier(user_id)
+        if dossier:
+            dossier_prefix = "Ниже перечислен набор фактов о пользователе:"
+            dossier_msg = {"role": "system", "content": f"{dossier_prefix}\n{dossier}"}
+            context_messages = [dossier_msg] + context_messages
+
+    # Запускаем обновление досье (fire-and-forget)
+    if user_id and config.get('use_ai', False):
+        dossier_manager.enqueue(user_id, message_text)
 
     # Формируем промпт с контекстом
     if provider in ['deepseek', 'yandexgpt', 'gigachat']:
@@ -451,7 +615,8 @@ async def handle_private_message(update: Update, context):
                 update.message.text,
                 bot_username,
                 chat_id,
-                user_name=user.first_name
+                user_name=user.first_name,
+                user_id=user.id
             )
 
             # Добавляем ответ бота в контекст
@@ -507,6 +672,32 @@ async def reload_config_command(update: Update, context):
         await send_long_message(update, f"❌ Ошибка: {str(e)}", parse_mode='Markdown')
 
 
+async def clear_dossier_command(update: Update, context):
+    """Команда для очистки досье конкретного пользователя"""
+    user = update.message.from_user
+    if user is None or user.username not in config.get('allowed_private_users', []):
+        return
+
+    args = context.args if context.args else []
+    if not args or not args[0].isdigit():
+        await send_long_message(update, "Использование: /clear_dossier <user_id>", parse_mode='Markdown')
+        return
+
+    target_user_id = int(args[0])
+    clear_dossier(target_user_id)
+    await send_long_message(update, f"✅ Досье пользователя {target_user_id} очищено!", parse_mode='Markdown')
+
+
+async def clear_dossiers_command(update: Update, context):
+    """Команда для очистки досье всех пользователей"""
+    user = update.message.from_user
+    if user is None or user.username not in config.get('allowed_private_users', []):
+        return
+
+    clear_all_dossiers()
+    await send_long_message(update, "✅ Досье всех пользователей очищены!", parse_mode='Markdown')
+
+
 async def handle_group_message_advanced(update: Update, context):
     """Расширенная обработка с детальным анализом цитируемых сообщений"""
     if update.message is None:
@@ -557,7 +748,8 @@ async def handle_group_message_advanced(update: Update, context):
                 enhanced_message,
                 bot_username,
                 chat_id,
-                user_name=user.first_name
+                user_name=user.first_name,
+                user_id=user.id
             )
 
             chat_context.add_message(chat_id, "assistant", ai_response)
@@ -645,18 +837,12 @@ def main():
         handle_private_message
     ))
 
-    # Команды для управления контекстом
-    application.add_handler(MessageHandler(
-        filters.Regex(r'^/clear_context$') & filters.ChatType.PRIVATE,
-        clear_context_command
-    ))
-
-    application.add_handler(MessageHandler(
-        filters.Regex(r'^/show_context$') & filters.ChatType.PRIVATE,
-        show_context_command
-    ))
-
+    # Команды
+    application.add_handler(CommandHandler("clear_context", clear_context_command, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("show_context", show_context_command, filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("reload_config", reload_config_command))
+    application.add_handler(CommandHandler("clear_dossier", clear_dossier_command, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("clear_dossiers", clear_dossiers_command, filters.ChatType.PRIVATE))
 
     print("Бот запущен с поддержкой контекста!")
     application.run_polling()
