@@ -4,6 +4,14 @@ use_ai: true
 # Пропишите сюда свой BOT Token
 bot_token: "abc"
 
+# Прокси для Telegram API (HTTP/HTTPS/SOCKS5). Пустой список = без прокси.
+# MTProto прокси (MTProxy) не поддерживаются для Bot API.
+# Для SOCKS5 нужен: pip install python-telegram-bot[socks]
+telegram_proxy:
+  # - "socks5://user:pass@host1:port1"
+  # - "socks5://user:pass@host2:port2"
+  # - "http://user:pass@host3:port3"
+
 # Настройки контекста
 context:
   max_length: 15

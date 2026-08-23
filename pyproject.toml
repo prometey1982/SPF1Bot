@@ -8,14 +8,14 @@ version = "0.1.0"
 dependencies = [
     "pyyaml",
     "requests",
-    "python-telegram-bot",
+    "python-telegram-bot[socks]",
 ]
 
 [tool.setuptools]
-packages = { find = { where = ["src"] } }
+packages = { find = { where = ["."] } }
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["."]
 
 [tool.coverage.run]
-source = ["src"]
+source = ["."]

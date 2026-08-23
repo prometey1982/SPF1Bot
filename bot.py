@@ -8,9 +8,63 @@ import logging
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
+from telegram.request import BaseRequest, HTTPXRequest
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+class ProxyRotatingRequest(BaseRequest):
+    """BaseRequest с автоматическим переключением прокси при ошибке соединения."""
+
+    def __init__(self, proxy_list: list[str], **kwargs):
+        self._proxies = proxy_list
+        self._current_index = 0
+        self._kwargs = kwargs
+        self._requests = [HTTPXRequest(proxy=p, **kwargs) for p in proxy_list]
+
+    @property
+    def proxy(self) -> str:
+        return self._proxies[self._current_index]
+
+    async def do_request(self, url, method, request_data=None, **kwargs):
+        last_error = None
+        for _ in range(len(self._proxies)):
+            req = self._requests[self._current_index]
+            try:
+                return await req.do_request(url, method, request_data, **kwargs)
+            except Exception as e:
+                logger.warning("Прокси %s недоступен: %s", self._proxies[self._current_index], e)
+                self._current_index = (self._current_index + 1) % len(self._proxies)
+        raise last_error
+
+    async def initialize(self):
+        for req in self._requests:
+            await req.initialize()
+
+    async def shutdown(self):
+        for req in self._requests:
+            await req.shutdown()
+
+    @property
+    def read_timeout(self):
+        return self._requests[self._current_index].read_timeout
+
+    @property
+    def write_timeout(self):
+        return self._requests[self._current_index].write_timeout
+
+    @property
+    def connect_timeout(self):
+        return self._requests[self._current_index].connect_timeout
+
+    @property
+    def pool_timeout(self):
+        return self._requests[self._current_index].pool_timeout
+
+    @property
+    def http_version(self):
+        return self._requests[self._current_index].http_version
 
 
 def split_text(text: str, max_length: int = 4096) -> list[str]:
@@ -627,7 +681,21 @@ async def enhance_message_with_quote(current_message, quoted_info, user_name):
 
 
 def main():
-    application = Application.builder().token(config.get('bot_token', "")).build()
+    token = config.get('bot_token', "")
+    proxy_list = config.get('telegram_proxy', [])
+
+    if proxy_list:
+        custom_request = ProxyRotatingRequest(proxy_list)
+        application = (
+            Application.builder()
+            .token(token)
+            .request(custom_request)
+            .get_updates_request(custom_request)
+            .build()
+        )
+        logger.info("Бот запущен с прокси: %s", proxy_list)
+    else:
+        application = Application.builder().token(token).build()
 
     # Обработчики сообщений
     application.add_handler(MessageHandler(
