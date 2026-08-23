@@ -10,7 +10,7 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
 from telegram.request import BaseRequest, HTTPXRequest
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
 logger = logging.getLogger(__name__)
 
 
@@ -184,7 +184,7 @@ def load_config():
         with open('config.yaml', 'r', encoding='utf-8') as file:
             return yaml.safe_load(file)
     except FileNotFoundError:
-        print("Файл config.yaml не найден!")
+        logger.error("Файл config.yaml не найден!")
         return {}
 
 
@@ -204,6 +204,24 @@ def init_db():
             id INTEGER PRIMARY KEY,
             dossier TEXT
         )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS user_mentions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            author_id INTEGER,
+            target_username TEXT,
+            chat_id INTEGER,
+            quote TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_mentions_target_ts
+        ON user_mentions (target_username, timestamp)
+    ''')
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_mentions_timestamp
+        ON user_mentions (timestamp)
     ''')
     conn.commit()
     conn.close()
@@ -252,6 +270,75 @@ def clear_all_dossiers():
         conn.close()
 
 
+# --- Mentions ---
+
+def add_mention(author_id: int, target_username: str, chat_id: int, quote: str):
+    conn = _get_conn()
+    try:
+        mentions_config = config.get('mentions', {})
+        max_quotes = mentions_config.get('max_quotes', 20)
+
+        conn.execute(
+            'INSERT INTO user_mentions (author_id, target_username, chat_id, quote) VALUES (?, ?, ?, ?)',
+            (author_id, target_username, chat_id, quote)
+        )
+
+        count = conn.execute(
+            'SELECT COUNT(*) FROM user_mentions WHERE target_username = ?',
+            (target_username,)
+        ).fetchone()[0]
+
+        if count > max_quotes:
+            conn.execute('''
+                DELETE FROM user_mentions WHERE id IN (
+                    SELECT id FROM user_mentions WHERE target_username = ?
+                    ORDER BY timestamp ASC LIMIT ?
+                )
+            ''', (target_username, count - max_quotes))
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_mentions_about_user(target_username: str) -> list[str]:
+    conn = _get_conn()
+    try:
+        mentions_config = config.get('mentions', {})
+        max_quotes = mentions_config.get('max_quotes', 20)
+        ttl_hours = mentions_config.get('ttl_hours', 24)
+
+        rows = conn.execute('''
+            SELECT quote FROM user_mentions
+            WHERE target_username = ?
+              AND timestamp > datetime('now', ? || ' hours')
+            ORDER BY timestamp DESC
+            LIMIT ?
+        ''', (target_username, -ttl_hours, max_quotes)).fetchall()
+
+        return [row[0] for row in rows]
+    finally:
+        conn.close()
+
+
+def cleanup_mentions():
+    conn = _get_conn()
+    try:
+        mentions_config = config.get('mentions', {})
+        ttl_hours = mentions_config.get('ttl_hours', 24)
+
+        deleted = conn.execute('''
+            DELETE FROM user_mentions
+            WHERE timestamp < datetime('now', ? || ' hours')
+        ''', (-ttl_hours,)).rowcount
+
+        conn.commit()
+        if deleted:
+            logger.info("Очищено %d упоминаний старше %dч", deleted, ttl_hours)
+    finally:
+        conn.close()
+
+
 # --- Dossier Manager ---
 
 class DossierManager:
@@ -259,11 +346,11 @@ class DossierManager:
         self._queues: dict[int, asyncio.Queue] = {}
         self._processing: set[int] = set()
 
-    def enqueue(self, user_id: int, message: str):
+    def enqueue(self, user_id: int, username: str, message: str):
         logger.info("Запуск обновления досье для user_id=%d", user_id)
         if user_id not in self._queues:
             self._queues[user_id] = asyncio.Queue()
-        self._queues[user_id].put_nowait(message)
+        self._queues[user_id].put_nowait((username, message))
         if user_id not in self._processing:
             asyncio.create_task(self._process_queue(user_id))
 
@@ -271,14 +358,24 @@ class DossierManager:
         self._processing.add(user_id)
         try:
             while not self._queues[user_id].empty():
-                messages = []
+                items = []
                 while not self._queues[user_id].empty():
-                    messages.append(self._queues[user_id].get_nowait())
+                    items.append(self._queues[user_id].get_nowait())
+
+                usernames = [item[0] for item in items]
+                messages = [item[1] for item in items]
+                username = usernames[-1]
 
                 current_dossier = get_dossier(user_id) or ""
                 dossier_config = config.get('dossier', {})
                 prompt_template = dossier_config.get('update_prompt', '')
                 combined_message = "\n".join(messages)
+
+                # Добавляем упоминания о пользователе от других
+                mentions = get_mentions_about_user(username)
+                if mentions:
+                    combined_message += "\nУпоминания о пользователе:\n" + "\n".join(mentions)
+
                 prompt = prompt_template.replace('{dossier}', current_dossier).replace('{message}', combined_message)
 
                 new_dossier = await self._call_with_retries(prompt, dossier_config)
@@ -333,6 +430,16 @@ def is_bot_mentioned(text, bot_username):
     return bool(re.search(pattern, text, re.IGNORECASE))
 
 
+def extract_user_mentions(text: str, bot_username: str) -> list[str]:
+    """Извлекает список @username из текста, исключая бота"""
+    if not text:
+        return []
+
+    pattern = r'@(\w+)'
+    matches = re.findall(pattern, text)
+    return [m for m in matches if m.lower() != bot_username.lower()]
+
+
 def is_admin(user) -> bool:
     """Проверяет, есть ли у пользователя доступ к административным командам"""
     return user is not None and user.username in config.get('allowed_private_users', [])
@@ -360,10 +467,12 @@ async def call_llm_raw(ai_config: dict, messages: list, provider: str, temperatu
         return await get_llama_response(ai_config, user_msg, temperature=temperature)
 
 
-async def get_ai_response_with_context(message_text, bot_username, chat_id, user_name="", user_id=None):
+async def get_ai_response_with_context(message_text, bot_username, chat_id, user_name="", user_id=None, user_username=""):
     """Получает ответ от нейросети с учетом контекста"""
     ai_config = config.get('ai', {})
     provider = ai_config.get('provider', 'deepseek')
+
+    logger.info("LLM запрос: provider=%s, chat_id=%d, user=%s", provider, chat_id, user_name)
 
     # Очищаем сообщение от упоминания бота
     if bot_username:
@@ -377,7 +486,7 @@ async def get_ai_response_with_context(message_text, bot_username, chat_id, user
     # Получаем историю диалога
     context_messages = chat_context.get_context(chat_id)
 
-    # Инжектим досье в контекст, если есть
+    # Инжектим досье в контексте, если есть
     if user_id and config.get('use_ai', False):
         dossier = get_dossier(user_id)
         if dossier:
@@ -387,7 +496,7 @@ async def get_ai_response_with_context(message_text, bot_username, chat_id, user
 
     # Запускаем обновление досье (fire-and-forget)
     if user_id and config.get('use_ai', False):
-        dossier_manager.enqueue(user_id, message_text)
+        dossier_manager.enqueue(user_id, user_username, message_text)
 
     # Формируем messages для LLM
     system_prompt = ai_config.get('system_prompt', 'Ты полезный ассистент. Отвечай на русском.')
@@ -397,7 +506,7 @@ async def get_ai_response_with_context(message_text, bot_username, chat_id, user
         # Современные API — передаём историю сообщений
         for msg in context_messages[-15:]:
             messages.append({"role": msg["role"], "content": msg["content"]})
-        return await call_llm_raw(ai_config, messages, provider)
+        result = await call_llm_raw(ai_config, messages, provider)
     else:
         # Legacy API (Llama) — собираем контекст в один текст
         context_text = ""
@@ -405,7 +514,14 @@ async def get_ai_response_with_context(message_text, bot_username, chat_id, user
             role = "Пользователь" if msg["role"] == "user" else "Ассистент"
             context_text += f"{role}: {msg['content']}\n"
         full_prompt = f"Контекст диалога:\n{context_text}\nТекущее сообщение: {message_text}\nОтвет:"
-        return await call_llm_raw(ai_config, [{"role": "user", "content": full_prompt}], provider)
+        result = await call_llm_raw(ai_config, [{"role": "user", "content": full_prompt}], provider)
+
+    if result.startswith("Ошибка"):
+        logger.warning("LLM ошибка: provider=%s, chat_id=%d, user=%s, error=%s", provider, chat_id, user_name, result)
+    else:
+        logger.info("LLM ответ: provider=%s, chat_id=%d, user=%s, length=%d", provider, chat_id, user_name, len(result))
+
+    return result
 
 
 async def get_llama_response(ai_config, prompt, temperature=None):
@@ -540,6 +656,15 @@ async def handle_message(update: Update, context):
 
     # Формирование сообщения
     message_text = update.message.text
+
+    # Упоминания пользователей (@username)
+    mentions_config = config.get('mentions', {})
+    min_length = mentions_config.get('min_length', 50)
+    if message_text and len(message_text) >= min_length:
+        mentioned_users = extract_user_mentions(message_text, bot_username)
+        for uname in mentioned_users:
+            add_mention(user.id, uname, chat_id, message_text[:200])
+
     if is_group:
         quoted_info = await analyze_quoted_message(update.message.reply_to_message)
         message_text = await enhance_message_with_quote(message_text, quoted_info, user.first_name)
@@ -549,7 +674,7 @@ async def handle_message(update: Update, context):
     if use_ai:
         ai_response = await get_ai_response_with_context(
             message_text, bot_username, chat_id,
-            user_name=user.first_name, user_id=user.id
+            user_name=user.first_name, user_id=user.id, user_username=user.username or ""
         )
         chat_context.add_message(chat_id, "assistant", ai_response)
         await send_long_message(update, ai_response, parse_mode='Markdown')
@@ -697,6 +822,8 @@ def main():
     else:
         application = Application.builder().token(token).build()
 
+    cleanup_mentions()
+
     # Обработчики сообщений
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
@@ -710,7 +837,7 @@ def main():
     application.add_handler(CommandHandler("clear_dossier", clear_dossier_command, filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("clear_dossiers", clear_dossiers_command, filters.ChatType.PRIVATE))
 
-    print("Бот запущен с поддержкой контекста!")
+    logger.info("Бот запущен с поддержкой контекста!")
     application.run_polling()
 
 
