@@ -240,6 +240,7 @@ class DossierManager:
         retry_count = dossier_config.get('update_retry_count', 3)
         backoff = dossier_config.get('backoff', 5)
         max_backoff = dossier_config.get('max_backoff', 60)
+        temperature = dossier_config.get('temperature', 0.1)
 
         ai_config = config.get('ai', {})
         provider = ai_config.get('provider', 'deepseek')
@@ -247,7 +248,7 @@ class DossierManager:
         for attempt in range(retry_count):
             try:
                 messages = [{"role": "user", "content": prompt}]
-                result = await call_llm_raw(ai_config, messages, provider)
+                result = await call_llm_raw(ai_config, messages, provider, temperature=temperature)
                 if result and not result.startswith("Ошибка"):
                     return result
                 logger.warning("Попытка %d/%d обновления досье: LLM вернул ошибку: %s", attempt + 1, retry_count, result)
@@ -278,6 +279,11 @@ def is_bot_mentioned(text, bot_username):
     return bool(re.search(pattern, text, re.IGNORECASE))
 
 
+def is_admin(user) -> bool:
+    """Проверяет, есть ли у пользователя доступ к административным командам"""
+    return user is not None and user.username in config.get('allowed_private_users', [])
+
+
 async def make_async_request(url, headers, data):
     """Асинхронно выполняет HTTP запрос"""
     loop = asyncio.get_event_loop()
@@ -291,18 +297,13 @@ async def make_async_request(url, headers, data):
         raise e
 
 
-async def call_llm_raw(ai_config: dict, messages: list, provider: str) -> str:
+async def call_llm_raw(ai_config: dict, messages: list, provider: str, temperature: float = None) -> str:
     """Вызывает LLM напрямую с переданными сообщениями."""
-    if provider in ['deepseek', 'yandexgpt', 'gigachat']:
-        if provider == 'deepseek':
-            return await get_deepseek_response(ai_config, messages)
-        elif provider == 'yandexgpt':
-            return await get_yandexgpt_response(ai_config, messages)
-        elif provider == 'gigachat':
-            return await get_gigachat_response(ai_config, messages)
+    if provider in PROVIDER_CONFIGS:
+        return await get_openai_compatible_response(ai_config, messages, provider, temperature=temperature)
     else:
         user_msg = next((m['content'] for m in messages if m['role'] == 'user'), '')
-        return await get_llama_response(ai_config, user_msg)
+        return await get_llama_response(ai_config, user_msg, temperature=temperature)
 
 
 async def get_ai_response_with_context(message_text, bot_username, chat_id, user_name="", user_id=None):
@@ -334,300 +335,174 @@ async def get_ai_response_with_context(message_text, bot_username, chat_id, user
     if user_id and config.get('use_ai', False):
         dossier_manager.enqueue(user_id, message_text)
 
-    # Формируем промпт с контекстом
-    if provider in ['deepseek', 'yandexgpt', 'gigachat']:
-        return await get_modern_ai_response(ai_config, context_messages, provider)
+    # Формируем messages для LLM
+    system_prompt = ai_config.get('system_prompt', 'Ты полезный ассистент. Отвечай на русском.')
+    messages = [{"role": "system", "content": system_prompt}]
+
+    if provider in PROVIDER_CONFIGS:
+        # Современные API — передаём историю сообщений
+        for msg in context_messages[-15:]:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+        return await call_llm_raw(ai_config, messages, provider)
     else:
-        return await get_legacy_ai_response(ai_config, context_messages, message_text, provider)
+        # Legacy API (Llama) — собираем контекст в один текст
+        context_text = ""
+        for msg in context_messages[-5:]:
+            role = "Пользователь" if msg["role"] == "user" else "Ассистент"
+            context_text += f"{role}: {msg['content']}\n"
+        full_prompt = f"Контекст диалога:\n{context_text}\nТекущее сообщение: {message_text}\nОтвет:"
+        return await call_llm_raw(ai_config, [{"role": "user", "content": full_prompt}], provider)
 
 
-async def get_modern_ai_response(ai_config, context_messages, provider):
-    """Для современных API, поддерживающих историю сообщений"""
-    try:
-        system_prompt = ai_config.get('system_prompt', 'Ты полезный ассистент. Отвечай на русском.')
-
-        # Формируем messages для API
-        messages = [{"role": "system", "content": system_prompt}]
-
-        # Добавляем историю диалога
-        for msg in context_messages[-15:]:  # Берем последние 15 сообщений
-            messages.append({
-                "role": msg["role"],
-                "content": msg["content"]
-            })
-
-        if provider == 'deepseek':
-            return await get_deepseek_response(ai_config, messages)
-        elif provider == 'yandexgpt':
-            return await get_yandexgpt_response(ai_config, messages)
-        elif provider == 'gigachat':
-            return await get_gigachat_response(ai_config, messages)
-
-    except Exception as e:
-        return f"Ошибка при обработке контекста: {str(e)}"
-
-
-async def get_legacy_ai_response(ai_config, context_messages, message_text, provider):
-    """Для API, которые не поддерживают историю сообщений"""
-    # Собираем контекст в один текст
-    context_text = ""
-    for msg in context_messages[-5:]:  # Берем последние 5 сообщений
-        role = "Пользователь" if msg["role"] == "user" else "Ассистент"
-        context_text += f"{role}: {msg['content']}\n"
-
-    full_prompt = f"Контекст диалога:\n{context_text}\nТекущее сообщение: {message_text}\nОтвет:"
-
-    if provider == 'llama':
-        return await get_llama_response(ai_config, full_prompt)
-    else:
-        return await get_deepseek_response(ai_config, [{"role": "user", "content": full_prompt}])
-
-
-async def get_llama_response(ai_config, prompt):
+async def get_llama_response(ai_config, prompt, temperature=None):
     """Llama API с поддержкой локальных моделей"""
     try:
-        # Получаем конфигурацию для Llama
         api_base = ai_config.get('llama_api_base', 'http://localhost:11434')
         model = ai_config.get('llama_model', 'llama2')
-
-        # Формируем URL для API
         url = f"{api_base}/api/chat" if api_base.endswith('/api/chat') else f"{api_base}/api/chat"
 
-        headers = {
-            "Content-Type": "application/json"
-        }
-
-        # Формируем данные для запроса в формате Ollama
         data = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
             "options": {
-                "temperature": config.get('temperature', 0.7),
+                "temperature": temperature if temperature is not None else ai_config.get('temperature', config.get('temperature', 0.7)),
                 "num_predict": config.get('max_tokens', 1000)
             }
         }
 
-        response = await make_async_request(url, headers, data)
+        response = await make_async_request(url, {"Content-Type": "application/json"}, data)
 
         if response.status_code == 200:
             result = response.json()
-
-            # Обрабатываем разные форматы ответов от разных Llama API
             if 'message' in result and 'content' in result['message']:
-                # Формат Ollama
-                response_text = result['message']['content']
+                return result['message']['content']
             elif 'choices' in result and len(result['choices']) > 0:
-                # Формат OpenAI-compatible
-                response_text = result['choices'][0]['message']['content']
+                return result['choices'][0]['message']['content']
             elif 'response' in result:
-                # Прямой ответ
-                response_text = result['response']
+                return result['response']
             else:
                 return "Llama API вернул неожиданный формат ответа"
-
-            return response_text
         else:
             return f"Ошибка Llama API: {response.status_code} - {response.text}"
-
     except Exception as e:
         return f"Ошибка при запросе к Llama: {str(e)}"
 
 
-async def get_deepseek_response(ai_config, messages):
-    """DeepSeek API с поддержкой контекста"""
+PROVIDER_CONFIGS = {
+    'deepseek': {
+        'url': 'https://api.deepseek.com/chat/completions',
+        'headers': lambda c: {"Authorization": f"Bearer {c.get('deepseek_api_key')}", "Content-Type": "application/json"},
+        'model': 'deepseek-reasoner',
+        'api_key': lambda c: c.get('deepseek_api_key'),
+        'default_temp': 1.3,
+        'error_name': 'DeepSeek',
+    },
+    'gigachat': {
+        'url': 'https://gigachat.devices.sberbank.ru/api/v1/chat/completions',
+        'headers': lambda c: {"Authorization": f"Bearer {c.get('gigachat_api_key')}", "Content-Type": "application/json", "Accept": "application/json"},
+        'model': 'GigaChat',
+        'api_key': lambda c: c.get('gigachat_api_key'),
+        'default_temp': 0.7,
+        'error_name': 'GigaChat',
+    },
+    'yandexgpt': {
+        'url': 'https://llm.api.cloud.yandex.net/foundationModels/v1/completion',
+        'headers': lambda c: {"Authorization": f"Api-Key {c.get('api_key')}", "Content-Type": "application/json"},
+        'model': None,
+        'api_key': lambda c: c.get('api_key'),
+        'default_temp': 0.6,
+        'error_name': 'Yandex GPT',
+        'build_data': lambda c, msgs, temp: {
+            "modelUri": f"gpt://{c.get('folder_id')}/yandexgpt/latest",
+            "completionOptions": {"stream": False, "temperature": temp, "maxTokens": 1000},
+            "messages": msgs,
+        },
+        'parse_response': lambda r: r['result']['alternatives'][0]['message']['text'],
+    },
+}
+
+
+async def get_openai_compatible_response(ai_config, messages, provider_name, temperature=None):
+    """Универсальный вызов OpenAI-совместимых API (DeepSeek, GigaChat, YandexGPT)."""
+    cfg = PROVIDER_CONFIGS[provider_name]
     try:
-        api_key = ai_config.get('deepseek_api_key')
+        api_key = cfg['api_key'](ai_config)
         if not api_key:
-            return "API ключ для DeepSeek не настроен"
+            return f"API ключ для {cfg['error_name']} не настроен"
 
-        url = "https://api.deepseek.com/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-
-        data = {
-            "model": "deepseek-reasoner",
+        temp = temperature if temperature is not None else ai_config.get('temperature', cfg['default_temp'])
+        data = cfg.get('build_data')(ai_config, messages, temp) if 'build_data' in cfg else {
+            "model": cfg['model'],
             "messages": messages,
-            "temperature": 1.3,
+            "temperature": temp,
             "max_tokens": 2000,
-            "stream": False
+            "stream": False,
         }
 
-        response = await make_async_request(url, headers, data)
+        response = await make_async_request(cfg['url'], cfg['headers'](ai_config), data)
 
         if response.status_code == 200:
             result = response.json()
-            response_text = result['choices'][0]['message']['content']
-
-            # Добавляем ответ ассистента в контекст
-            # (это делается в основной функции после возврата)
-            return response_text
+            if 'parse_response' in cfg:
+                return cfg['parse_response'](result)
+            return result['choices'][0]['message']['content']
         else:
-            return f"Ошибка DeepSeek API: {response.status_code}"
-
+            return f"Ошибка {cfg['error_name']} API: {response.status_code} - {response.text}"
     except Exception as e:
-        return f"Ошибка при запросе к DeepSeek: {str(e)}"
+        return f"Ошибка при запросе к {cfg['error_name']}: {str(e)}"
 
 
-async def get_yandexgpt_response(ai_config, messages):
-    """Yandex GPT API"""
-    try:
-        api_key = ai_config.get('api_key')
-        folder_id = ai_config.get('folder_id')
-
-        if not api_key or not folder_id:
-            return "Не настроен API ключ или folder_id для Yandex GPT"
-
-        url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-        headers = {
-            "Authorization": f"Api-Key {api_key}",
-            "Content-Type": "application/json"
-        }
-        data = {
-            "modelUri": f"gpt://{folder_id}/yandexgpt/latest",
-            "completionOptions": {
-                "stream": False,
-                "temperature": 0.6,
-                "maxTokens": 1000
-            },
-            "messages": messages
-        }
-
-        response = await make_async_request(url, headers, data)
-
-        if response.status_code == 200:
-            result = response.json()
-            return result['result']['alternatives'][0]['message']['text']
-        else:
-            return f"Ошибка Yandex GPT API: {response.status_code} - {response.text}"
-
-    except Exception as e:
-        return f"Ошибка при запросе к Yandex GPT: {str(e)}"
-
-
-async def get_gigachat_response(ai_config, messages):
-    """GigaChat API с поддержкой контекста"""
-    try:
-        # Получаем конфигурацию для GigaChat
-        api_key = ai_config.get('gigachat_api_key')
-        if not api_key:
-            return "API ключ для GigaChat не настроен"
-
-        # URL для GigaChat API
-        url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
-
-        # Формируем данные для запроса
-        data = {
-            "model": "GigaChat",  # или другая модель GigaChat
-            "messages": messages,
-            "temperature": 0.7,
-            "max_tokens": 2000,
-            "stream": False
-        }
-
-        response = await make_async_request(url, headers, data)
-
-        if response.status_code == 200:
-            result = response.json()
-            # GigaChat возвращает ответ в формате choices[0].message.content
-            if 'choices' in result and len(result['choices']) > 0:
-                response_text = result['choices'][0]['message']['content']
-                return response_text
-            else:
-                return "GigaChat API вернул неожиданный формат ответа"
-        else:
-            return f"Ошибка GigaChat API: {response.status_code} - {response.text}"
-
-    except Exception as e:
-        return f"Ошибка при запросе к GigaChat: {str(e)}"
-
-
-async def handle_group_message(update: Update, context):
-    """Обрабатывает сообщения в группах с учетом контекста"""
+async def handle_message(update: Update, context):
+    """Единый обработчик сообщений для групп и личных чатов"""
     if update.message is None:
         return
     user = update.message.from_user
-    bot_username = context.bot.username
-    chat_id = update.message.chat_id
-
-    mentioned = is_bot_mentioned(update.message.text, bot_username)
-    replied_to_bot = (
-            update.message.reply_to_message and
-            update.message.reply_to_message.from_user.id == context.bot.id
-    )
-
-    print(f"Группа: {update.message.chat.title}")
-    print(f"Чат: {chat_id}")
-    print(f"От: {user.first_name} (ID: {user.id})")
-    print(f"Упоминание: {mentioned}, Ответ боту: {replied_to_bot}")
-
-    always_respond_to_users = config.get('always_respond_to_users')
-
-    if (mentioned or replied_to_bot) or user in always_respond_to_users:
-        use_ai = config.get('use_ai', False)
-
-        if use_ai:
-            # Получаем ответ с учетом контекста
-            ai_response = await get_ai_response_with_context(
-                update.message.text,
-                bot_username,
-                chat_id,
-                user_name=user.first_name
-            )
-
-            # Добавляем ответ бота в контекст
-            chat_context.add_message(chat_id, "assistant", ai_response)
-
-            if chat_id in config.allowed_group_chat_ids:
-                await send_long_message(update, ai_response, parse_mode='Markdown')
-                print(f"AI ответ: {ai_response}")
-        else:
-            responses = config.get('responses', [])
-            if responses and chat_id in config.allowed_group_chat_ids:
-                response = random.choice(responses)
-                await send_long_message(update, response, parse_mode='Markdown')
-    print("---")
-
-
-async def handle_private_message(update: Update, context):
-    """Обрабатывает личные сообщения с учетом контекста"""
-    user = update.message.from_user
     if user is None:
         return
+
     bot_username = context.bot.username
     chat_id = update.message.chat_id
+    is_group = update.message.chat.type in ('group', 'supergroup')
 
-    allowed_private_users = config.get('allowed_private_users')
+    # Проверка доступа
+    if is_group:
+        message_thread_id = update.message.message_thread_id
+        allowed_chat_ids = config.get('allowed_group_chat_ids', [])
+        if message_thread_id not in allowed_chat_ids:
+            return
 
-    if user.username in allowed_private_users:
-        use_ai = config.get('use_ai', False)
+        always_respond = config.get('always_respond_to_users', [])
+        mentioned = is_bot_mentioned(update.message.text, bot_username)
+        replied_to_bot = (
+            update.message.reply_to_message and
+            update.message.reply_to_message.from_user.id == context.bot.id
+        )
+        if not (mentioned or replied_to_bot or user.username in always_respond):
+            return
+    else:
+        if user.username not in config.get('allowed_private_users', []):
+            return
 
-        if use_ai:
-            ai_response = await get_ai_response_with_context(
-                update.message.text,
-                bot_username,
-                chat_id,
-                user_name=user.first_name,
-                user_id=user.id
-            )
+    # Формирование сообщения
+    message_text = update.message.text
+    if is_group:
+        quoted_info = await analyze_quoted_message(update.message.reply_to_message)
+        message_text = await enhance_message_with_quote(message_text, quoted_info, user.first_name)
 
-            # Добавляем ответ бота в контекст
-            chat_context.add_message(chat_id, "assistant", ai_response)
-
-            await send_long_message(update, ai_response, parse_mode='Markdown')
-        else:
-            responses = config.get('responses', [])
-            if responses:
-                response = random.choice(responses)
-                await send_long_message(update, response, parse_mode='Markdown')
+    # Вызов AI или случайный ответ
+    use_ai = config.get('use_ai', False)
+    if use_ai:
+        ai_response = await get_ai_response_with_context(
+            message_text, bot_username, chat_id,
+            user_name=user.first_name, user_id=user.id
+        )
+        chat_context.add_message(chat_id, "assistant", ai_response)
+        await send_long_message(update, ai_response, parse_mode='Markdown')
+    else:
+        responses = config.get('responses', [])
+        if responses:
+            await send_long_message(update, random.choice(responses), parse_mode='Markdown')
 
 
 async def clear_context_command(update: Update, context):
@@ -655,18 +530,14 @@ async def show_context_command(update: Update, context):
 
 
 async def reload_config_command(update: Update, context):
-    """Команда для показа текущего контекста (для отладки)"""
+    """Команда для перезагрузки конфигурации"""
     try:
         user = update.message.from_user
-        if user is None:
+        if not is_admin(user):
             return
 
         global config
-
-        if user.username not in config.get('allowed_private_users'):
-            return
-
-        config = load_config()  # Перезагружаем конфиг
+        config = load_config()
         await send_long_message(update, "✅ Конфигурация перезагружена!", parse_mode='Markdown')
     except Exception as e:
         await send_long_message(update, f"❌ Ошибка: {str(e)}", parse_mode='Markdown')
@@ -675,7 +546,7 @@ async def reload_config_command(update: Update, context):
 async def clear_dossier_command(update: Update, context):
     """Команда для очистки досье конкретного пользователя"""
     user = update.message.from_user
-    if user is None or user.username not in config.get('allowed_private_users', []):
+    if not is_admin(user):
         return
 
     args = context.args if context.args else []
@@ -691,75 +562,11 @@ async def clear_dossier_command(update: Update, context):
 async def clear_dossiers_command(update: Update, context):
     """Команда для очистки досье всех пользователей"""
     user = update.message.from_user
-    if user is None or user.username not in config.get('allowed_private_users', []):
+    if not is_admin(user):
         return
 
     clear_all_dossiers()
     await send_long_message(update, "✅ Досье всех пользователей очищены!", parse_mode='Markdown')
-
-
-async def handle_group_message_advanced(update: Update, context):
-    """Расширенная обработка с детальным анализом цитируемых сообщений"""
-    if update.message is None:
-        return
-
-    user = update.message.from_user
-
-    if user is None:
-        return
-
-    bot_username = context.bot.username
-    chat_id = update.message.chat_id
-    message_thread_id = update.message.message_thread_id
-
-    if chat_id is None:
-        return
-
-    # Анализ цитируемого сообщения
-    quoted_info = await analyze_quoted_message(update.message.reply_to_message)
-
-    mentioned = is_bot_mentioned(update.message.text, bot_username)
-    replied_to_bot = (
-            update.message.reply_to_message and
-            update.message.reply_to_message.from_user.id == context.bot.id
-    )
-
-    print(f"Группа: {update.message.chat.title}")
-    print(f"Чат: {chat_id}")
-    print(f"Message thread id: {message_thread_id}")
-    print(f"От: {user.first_name} (ID: {user.id})")
-    print(f"Цитирование: {quoted_info}")
-
-    always_respond_to_users = config.get('always_respond_to_users')
-
-    if (mentioned or replied_to_bot or user.username in always_respond_to_users) and message_thread_id in config.get(
-            'allowed_group_chat_ids', []):
-        use_ai = config.get('use_ai', False)
-
-        if use_ai:
-            # Формируем расширенный контекст с цитатой
-            enhanced_message = await enhance_message_with_quote(
-                update.message.text,
-                quoted_info,
-                user.first_name
-            )
-
-            ai_response = await get_ai_response_with_context(
-                enhanced_message,
-                bot_username,
-                chat_id,
-                user_name=user.first_name,
-                user_id=user.id
-            )
-
-            chat_context.add_message(chat_id, "assistant", ai_response)
-            await send_long_message(update, ai_response, parse_mode='Markdown')
-
-        else:
-            responses = config.get('responses', [])
-            if responses:
-                response = random.choice(responses)
-                await send_long_message(update, response, parse_mode='Markdown')
 
 
 async def analyze_quoted_message(quoted_message):
@@ -824,17 +631,8 @@ def main():
 
     # Обработчики сообщений
     application.add_handler(MessageHandler(
-        filters.TEXT & filters.ChatType.GROUPS,
-        handle_group_message_advanced
-    ))
-    # application.add_handler(MessageHandler(
-    #     filters.TEXT & filters.ChatType.GROUPS,
-    #     handle_group_message
-    # ))
-
-    application.add_handler(MessageHandler(
-        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
-        handle_private_message
+        filters.TEXT & ~filters.COMMAND,
+        handle_message
     ))
 
     # Команды
