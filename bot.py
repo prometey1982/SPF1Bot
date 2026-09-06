@@ -920,6 +920,95 @@ async def clear_dossiers_command(update: Update, context):
     await send_long_message(update, "✅ Досье всех пользователей очищены!", parse_mode='Markdown')
 
 
+# --- Wiki: команды admin (ТЗ user_wiki_tz.md, п. 13) ---
+
+async def _wiki_send(update, text: str):
+    # Без parse_mode: содержимое страниц/wiki — произвольный markdown
+    await send_long_message(update, text, parse_mode=None)
+
+
+def _first_user_id_arg(update, context):
+    args = context.args if context.args else []
+    if not args or not args[0].isdigit():
+        return None, "Укажите <user_id> (целое число)."
+    return int(args[0]), None
+
+
+async def show_wiki_command(update: Update, context):
+    if not is_admin(update.message.from_user):
+        return
+    user_id, err = _first_user_id_arg(update, context)
+    if user_id is None:
+        await _wiki_send(update, f"Использование: /show_wiki <user_id> — {err}")
+        return
+    text = botwiki.admin.show_wiki(botwiki.config.db_path(), user_id)
+    await _wiki_send(update, text or f"У пользователя {user_id} нет валидной wiki.")
+
+
+async def show_wiki_page_command(update: Update, context):
+    if not is_admin(update.message.from_user):
+        return
+    args = context.args if context.args else []
+    if len(args) < 2 or not args[0].isdigit():
+        await _wiki_send(update, "Использование: /show_wiki_page <user_id> <slug>")
+        return
+    user_id = int(args[0])
+    text = botwiki.admin.show_wiki_page(botwiki.config.db_path(), user_id, args[1])
+    await _wiki_send(update, text)
+
+
+async def wiki_status_command(update: Update, context):
+    if not is_admin(update.message.from_user):
+        return
+    user_id, err = _first_user_id_arg(update, context)
+    if user_id is None:
+        await _wiki_send(update, f"Использование: /wiki_status <user_id> — {err}")
+        return
+    text = botwiki.admin.wiki_status(botwiki.config.db_path(), user_id)
+    await _wiki_send(update, text)
+
+
+async def reconcile_wiki_command(update: Update, context):
+    if not is_admin(update.message.from_user):
+        return
+    user_id, err = _first_user_id_arg(update, context)
+    if user_id is None:
+        await _wiki_send(update, f"Использование: /reconcile_wiki <user_id> — {err}")
+        return
+    result = await botwiki.wiki_manager.reconcile(user_id)
+    await _wiki_send(update, result.get('message', 'Reconcile выполнен.'))
+
+
+async def merge_wiki_pages_command(update: Update, context):
+    if not is_admin(update.message.from_user):
+        return
+    args = context.args if context.args else []
+    if len(args) < 3 or not args[0].isdigit():
+        await _wiki_send(update,
+                         "Использование: /merge_wiki_pages <user_id> <slug1> <slug2>")
+        return
+    user_id, slug1, slug2 = int(args[0]), args[1], args[2]
+    result = await botwiki.wiki_manager.merge_pages(user_id, slug1, slug2)
+    await _wiki_send(update, result['message'])
+
+
+async def clear_wiki_command(update: Update, context):
+    if not is_admin(update.message.from_user):
+        return
+    args = context.args if context.args else []
+    if len(args) < 2 or not args[0].isdigit():
+        await _wiki_send(update,
+                         "Использование: /clear_wiki <user_id> confirm  (dossier не трогается)")
+        return
+    if args[1] != 'confirm':
+        await _wiki_send(update, "Подтвердите: /clear_wiki <user_id> confirm")
+        return
+    user_id = int(args[0])
+    text = botwiki.admin.clear_wiki(botwiki.config.db_path(), user_id)
+    await _wiki_send(update, text)
+    logger.info("clear_wiki: admin=%s user_id=%d", update.message.from_user.username, user_id)
+
+
 async def analyze_quoted_message(quoted_message):
     """Анализирует цитируемое сообщение и возвращает информацию о нем"""
     if not quoted_message:
@@ -1023,6 +1112,12 @@ def main():
     application.add_handler(CommandHandler("reload_config", reload_config_command))
     application.add_handler(CommandHandler("clear_dossier", clear_dossier_command, filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("clear_dossiers", clear_dossiers_command, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("show_wiki", show_wiki_command, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("show_wiki_page", show_wiki_page_command, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("wiki_status", wiki_status_command, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("reconcile_wiki", reconcile_wiki_command, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("merge_wiki_pages", merge_wiki_pages_command, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("clear_wiki", clear_wiki_command, filters.ChatType.PRIVATE))
 
     logger.info("Бот запущен с поддержкой контекста!")
     application.run_polling()

@@ -278,3 +278,89 @@ def trim_rows(db_path: str, user_id: int, max_rows: int, source: str | None = 'l
         return cursor.rowcount or 0
     finally:
         conn.close()
+
+
+# --- Вспомогательные запросы reconcile / команд (ТЗ п. 9.6, 13) ---
+
+def last_username(db_path: str, user_id: int) -> str | None:
+    """Последний известный @alias пользователя (для доступа к user_mentions)."""
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT username FROM user_raw WHERE user_id = ? AND username IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
+        return row['username'] if row else None
+    finally:
+        conn.close()
+
+
+def get_mentions_quotes(db_path: str, username: str, ttl_hours: int = 24,
+                        limit: int = 50) -> list[str]:
+    """Цитаты об упомянутом пользователе (user_mentions, как в bot.py)."""
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT quote FROM user_mentions
+            WHERE target_username = ?
+              AND timestamp > datetime('now', ? || ' hours')
+            ORDER BY timestamp DESC LIMIT ?
+            """, (username, -ttl_hours, limit)).fetchall()
+        return [r['quote'] for r in rows]
+    except sqlite3.OperationalError:
+        # Таблица user_mentions может отсутствовать в тестовой БД
+        return []
+    finally:
+        conn.close()
+
+
+def username_aliases(db_path: str, user_id: int) -> list[str]:
+    """Все встречавшиеся @alias'ы пользователя (для очистки mentions)."""
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT username FROM user_raw WHERE user_id = ? AND username IS NOT NULL",
+            (user_id,)).fetchall()
+        return [r['username'] for r in rows]
+    finally:
+        conn.close()
+
+
+def delete_mentions_for_aliases(db_path: str, aliases: list[str]) -> int:
+    if not aliases:
+        return 0
+    conn = connect(db_path)
+    try:
+        placeholders = ','.join('?' * len(aliases))
+        cursor = conn.execute(
+            f"DELETE FROM user_mentions WHERE target_username IN ({placeholders})",
+            aliases)
+        conn.commit()
+        return cursor.rowcount or 0
+    except sqlite3.OperationalError:
+        return 0
+    finally:
+        conn.close()
+
+
+def delete_raw_all(db_path: str, user_id: int) -> int:
+    conn = connect(db_path)
+    try:
+        cursor = conn.execute("DELETE FROM user_raw WHERE user_id = ?", (user_id,))
+        conn.commit()
+        return cursor.rowcount or 0
+    finally:
+        conn.close()
+
+
+def count_uncovered_export(db_path: str, user_id: int, watermark: int) -> int:
+    """Число импортированных строк вне покрытия watermark (наблюдаемость, п. 14)."""
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM user_raw "
+            "WHERE user_id = ? AND source = 'export' AND id > ?",
+            (user_id, watermark)).fetchone()
+        return row['c'] if row else 0
+    finally:
+        conn.close()

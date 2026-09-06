@@ -148,6 +148,7 @@ WIKI_DEFAULTS = {
         'update_page_prompt': '',
         'create_page_prompt': '',
         'reconcile_prompt': '',
+        'merge_page_prompt': '',
     },
 }
 

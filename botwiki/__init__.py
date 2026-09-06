@@ -18,6 +18,7 @@ from . import textutil as textutil
 from . import router as router
 from . import topics as topics
 from . import manager as manager
+from . import admin as admin
 
 configure = config.configure
 settings = config.settings

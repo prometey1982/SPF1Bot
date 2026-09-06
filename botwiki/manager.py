@@ -74,6 +74,21 @@ def _build_raw_block(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _build_reconcile_window(rows: list[dict], max_chars: int) -> str:
+    """Блок окна raw для reconcile, ограниченный max_raw_chars."""
+    lines = []
+    total = 0
+    for i, row in enumerate(reversed(rows), 1):  # последние сверху
+        content = (row.get('content') or '').strip()
+        if not content:
+            continue
+        if total + len(content) > max_chars:
+            break
+        lines.append(f"[{i}] {content}")
+        total += len(content)
+    return "\n".join(lines)
+
+
 def _validate_page_md(md: str | None, max_chars: int) -> str | None:
     if not md:
         return None
@@ -99,6 +114,7 @@ class BudgetTracker:
     def __init__(self):
         self._day: dict[int, tuple[str, int]] = {}    # user -> (yyyymmdd, count)
         self._hour: dict[int, tuple[int, int]] = {}   # user -> (epoch_hour, count)
+        self._reconcile_day: dict[int, tuple[str, int]] = {}  # reconcile/день
 
     @staticmethod
     def _day_key() -> str:
@@ -138,6 +154,22 @@ class BudgetTracker:
             self._hour[user_id] = (bucket, count)
         else:
             self._hour[user_id] = (bucket, value[1] + count)
+
+    def reconcile_budget(self, user_id: int, day_limit: int) -> bool:
+        """Достигнут ли дневной лимит reconcile (True — можно)."""
+        if day_limit <= 0:
+            return False
+        bucket = self._day_key()
+        value = self._reconcile_day.get(user_id)
+        return value is None or value[0] != bucket or value[1] < day_limit
+
+    def consume_reconcile(self, user_id: int):
+        bucket = self._day_key()
+        value = self._reconcile_day.get(user_id)
+        if value is None or value[0] != bucket:
+            self._reconcile_day[user_id] = (bucket, 1)
+        else:
+            self._reconcile_day[user_id] = (bucket, value[1] + 1)
 
 
 class WikiManager:
@@ -256,6 +288,11 @@ class WikiManager:
                     await self._maybe_create_topic_page(user_id, user_dir, index_data, pages_cfg)
                 except Exception as e:
                     logger.warning("wiki: ошибка создания страниц user_id=%d: %s", user_id, e)
+                # Авто-reconcile по message_count (п. 9.6)
+                try:
+                    await self.maybe_auto_reconcile(user_id, index_data)
+                except Exception as e:
+                    logger.warning("wiki: ошибка авто-reconcile user_id=%d: %s", user_id, e)
                 return True
 
     # --- обработка одного снимка ---
@@ -514,6 +551,235 @@ class WikiManager:
             logger.info("wiki: реактивирована архивная страница %s (user=%d)", slug, user_id)
             return True
         return False
+
+    # --- reconcile (п. 9.6) и ручное слияние (п. 13) ---
+
+    async def maybe_auto_reconcile(self, user_id: int, index_data: dict) -> bool:
+        """Авто-reconcile по message_count (вызывается после успешного инкремента)."""
+        settings = config.settings()
+        reconcile_cfg = settings.get('reconcile', {})
+        budgets_cfg = settings.get('budgets', {})
+        if index_data.get('message_count', 0) < reconcile_cfg.get('every_n_messages', 100):
+            return False
+        if not self.budget.reconcile_budget(
+                user_id, budgets_cfg.get('reconcile_llm_calls_per_user_per_day', 20)):
+            return False
+        if not self.budget.llm_budget(
+                user_id, budgets_cfg.get('max_llm_calls_per_user_per_hour', 5)):
+            return False
+        result = await self._reconcile(user_id)
+        return bool(result.get('success'))
+
+    async def reconcile(self, user_id: int) -> dict:
+        """Ручной /reconcile_wiki (вне обычного бюджета при allow_manual_*)."""
+        return await self._reconcile(user_id, manual=True)
+
+    async def _reconcile(self, user_id: int, manual: bool = False) -> dict:
+        settings = config.settings()
+        reconcile_cfg = settings.get('reconcile', {})
+        pages_cfg = settings.get('pages', {})
+        budgets_cfg = settings.get('budgets', {})
+        prompts_cfg = settings.get('prompts', {})
+        page_max = pages_cfg.get('max_page_chars', 2000)
+        db_path = config.db_path()
+        user_dir = pageio.user_wiki_dir(user_id)
+
+        index_data, _ = index_mod.ensure_index(user_dir, db_path, user_id)
+        if index_data is None:
+            return {'success': False, 'partial': False,
+                    'message': 'У пользователя нет валидной wiki.'}
+
+        rec_day_limit = budgets_cfg.get('reconcile_llm_calls_per_user_per_day', 20)
+        if not self.budget.reconcile_budget(user_id, rec_day_limit):
+            return {'success': False, 'partial': False,
+                    'message': 'Дневной лимит reconcile исчерпан.'}
+        if not manual and not self.budget.llm_budget(
+                user_id, budgets_cfg.get('max_llm_calls_per_user_per_hour', 5)):
+            return {'success': False, 'partial': False, 'message': 'Бюджет LLM исчерпан.'}
+
+        # Окно raw (последние строки по id) + упоминания
+        rows = db.fetch_window_rows(db_path, user_id, reconcile_cfg.get('window_messages', 300))
+        window_block = _build_reconcile_window(rows, reconcile_cfg.get('max_raw_chars', 100000))
+        mentions: list[str] = []
+        if reconcile_cfg.get('include_mentions', True):
+            username = db.last_username(db_path, user_id)
+            if username:
+                mentions = db.get_mentions_quotes(
+                    db_path, username,
+                    ttl_hours=settings.get('mentions', {}).get('ttl_hours', 24),
+                    limit=reconcile_cfg.get('max_mentions', 50))
+        mentions_block = "\n".join(f"Упоминание: {q[:500]}" for q in mentions)
+
+        now = _page_meta_now()
+        now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+        stale_days = pages_cfg.get('archive_after_days', 90)
+        window_tokens = textutil.token_set(window_block)
+
+        active_themes = []
+        for page in index_data.get('pages', []):
+            if page.get('status') != 'active':
+                continue
+            slug = page.get('slug', '')
+            if slug in ('Home', 'Style'):
+                continue
+            active_themes.append(page)
+
+        # Устаревание страниц-тем по last_seen (не Home/Style); null не архивирует
+        stale_slugs = set()
+        for page in active_themes:
+            ts = page.get('last_seen') or page.get('updated')
+            if ts is None:
+                continue
+            try:
+                parsed = datetime.fromisoformat(ts)
+                if parsed.tzinfo is not None:
+                    parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            except ValueError:
+                continue
+            age_days = (now_dt - parsed).total_seconds() / 86400
+            confirmed = bool(window_tokens and router.score_query(window_tokens, page) > 0)
+            if not confirmed and age_days >= stale_days:
+                stale_slugs.add(page.get('slug'))
+
+        # Кандидаты на LLM-обновление: Home, Style, подтверждённые темы
+        candidates = []
+        seen = set()
+        for slug in ('Home', 'Style'):
+            page = index_mod.find_page(index_data, slug)
+            if page is not None and page.get('status') == 'active':
+                candidates.append(page)
+                seen.add(slug)
+        for page in active_themes:
+            slug = page['slug']
+            if slug in stale_slugs or slug in seen:
+                continue
+            if window_tokens and router.score_query(window_tokens, page) > 0:
+                candidates.append(page)
+
+        cap = reconcile_cfg.get('max_pages_per_reconcile', 10)
+        partial = len(candidates) > cap
+        chosen = candidates[:cap]
+
+        # Генерируем новые версии (все валидные — иначе не успех, п. 3.4 ревью)
+        new_pages: dict[str, str] = {}
+        for page in chosen:
+            slug = page['slug']
+            current_md = pageio.read_page(user_dir, slug) or ''
+            target = self._target_chars(slug, pages_cfg)
+            prompt_text = prompts.build_reconcile_prompt(
+                prompts_cfg.get('reconcile_prompt'),
+                slug=slug, title=page.get('title', slug), current_md=current_md,
+                target_chars=target, max_chars=page_max,
+                window_block=window_block, mentions_block=mentions_block)
+            self.budget.consume_llm(user_id)
+            md = await self._llm_call(prompt_text)
+            md = _validate_page_md(md, page_max)
+            if md is None:
+                return {'success': False, 'partial': True,
+                        'message': f'Reconcile не завершён: невалидный ответ LLM для {slug}. '
+                                   'Повторите позже.'}
+            new_pages[slug] = md
+
+        for slug, md in new_pages.items():
+            if not pageio.atomic_write_page(user_dir, slug, md):
+                return {'success': False, 'partial': True,
+                        'message': f'Ошибка записи {slug}.md при reconcile.'}
+
+        # Применяем изменения индекса
+        for page in index_data.get('pages', []):
+            slug = page.get('slug', '')
+            if slug in stale_slugs:
+                page['status'] = 'archived'
+                logger.info("wiki reconcile: страница %s → archived (user=%d)", slug, user_id)
+        for slug in new_pages:
+            page = index_mod.find_page(index_data, slug)
+            if page:
+                page['updated'] = now
+                page['last_seen'] = now
+        # Подтверждённые, но не выбранные из-за cap, темы: last_seen освежается (п. 7.2)
+        for page in candidates[len(chosen):]:
+            page['last_seen'] = now
+
+        index_data['last_error'] = None
+        if not partial:
+            index_data['message_count'] = 0
+            index_data['last_reconcile'] = now
+            self.budget.consume_reconcile(user_id)
+            if manual:
+                self.unpause(user_id)
+        index_data['last_update'] = now
+
+        if not index_mod.save_index(user_dir, index_data):
+            return {'success': False, 'partial': True,
+                    'message': 'Ошибка записи индекса при reconcile.'}
+
+        logger.info("wiki reconcile: user_id=%d страниц=%d partial=%s archived=%d",
+                    user_id, len(new_pages), partial, len(stale_slugs))
+        if partial:
+            return {'success': False, 'partial': True,
+                    'message': f'Reconcile обработал {len(new_pages)} из {len(candidates)} '
+                               'страниц; message_count не сброшен — повторите позже.'}
+        return {'success': True, 'partial': False,
+                'message': f'Reconcile выполнен: обновлено страниц={len(new_pages)}, '
+                           f'архивировано={len(stale_slugs)}.'}
+
+    async def merge_pages(self, user_id: int, slug1: str, slug2: str) -> dict:
+        """Слияние страниц slug2 → slug1 (п. 13). Возвращает (ok, message)."""
+        settings = config.settings()
+        pages_cfg = settings.get('pages', {})
+        prompts_cfg = settings.get('prompts', {})
+        page_max = pages_cfg.get('max_page_chars', 2000)
+        user_dir = pageio.user_wiki_dir(user_id)
+        index_data, _ = index_mod.ensure_index(user_dir, config.db_path(), user_id)
+        if index_data is None:
+            return {'ok': False, 'message': 'У пользователя нет валидной wiki.'}
+        if slug1 == slug2:
+            return {'ok': False, 'message': 'Страницы должны различаться.'}
+        if slug1 in ('Home', 'Style'):
+            return {'ok': False, 'message': 'slug1 не может быть служебной страницей.'}
+        if not pageio.is_safe_slug(slug1) or not pageio.is_safe_slug(slug2):
+            return {'ok': False, 'message': 'Небезопасный slug.'}
+
+        page1 = index_mod.find_page(index_data, slug1)
+        page2 = index_mod.find_page(index_data, slug2)
+        if page1 is None or page2 is None:
+            return {'ok': False, 'message': 'Одна из страниц не найдена.'}
+        md1 = pageio.read_page(user_dir, slug1) or ''
+        md2 = pageio.read_page(user_dir, slug2) or ''
+
+        prompt_text = prompts.build_merge_prompt(
+            prompts_cfg.get('merge_page_prompt'),
+            target_slug=slug1, target_title=page1.get('title', slug1), target_md=md1,
+            source_slug=slug2, source_title=page2.get('title', slug2), source_md=md2,
+            max_chars=page_max)
+        merged = await self._llm_call(prompt_text)
+        merged = _validate_page_md(merged, page_max)
+        if merged is None:
+            return {'ok': False, 'message': 'Невалидный ответ LLM при слиянии.'}
+
+        now = _page_meta_now()
+        page1['status'] = 'active'
+        page1['updated'] = now
+        page1['last_seen'] = now
+        page1['title'] = page1.get('title') or slug1
+        # Объединение keywords/aliases без дублей
+        for key in ('keywords', 'aliases'):
+            merged_list = []
+            seen = set()
+            for item in list(page1.get(key, [])) + list(page2.get(key, [])):
+                if item and item not in seen:
+                    seen.add(item)
+                    merged_list.append(item)
+            page1[key] = merged_list
+        page2['status'] = 'archived'
+
+        if not (pageio.atomic_write_page(user_dir, slug1, merged)
+                and pageio.atomic_write_page(user_dir, slug2, pageio.read_page(user_dir, slug2) or '')
+                and index_mod.save_index(user_dir, index_data)):
+            return {'ok': False, 'message': 'Ошибка записи при слиянии (изменения не применены).'}
+        logger.info("wiki merge: user_id=%d %s <- %s", user_id, slug1, slug2)
+        return {'ok': True,
+                'message': f'Страница {slug2} влита в {slug1}; {slug2} архивирована.'}
 
     # --- bootstrap (п. 9.7) ---
 

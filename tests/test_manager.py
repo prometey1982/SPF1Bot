@@ -462,3 +462,110 @@ def test_create_topic_skipped_on_invalid_proposal(tmp_path, db_path):
     cooldowns = idx.get('page_proposal_cooldowns') or {}
     assert 'гараж' in cooldowns
 
+
+class ReconcileLLM:
+    """Fake: Home/Style/темы на reconcile, отдельные маркеры для merge."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def __call__(self, prompt):
+        self.calls += 1
+        if 'Слей две страницы' in prompt:
+            return '# Объединено\n- общий факт'
+        if 'Style' in prompt or 'Стиль' in prompt:
+            return '# Стиль\n\n- стиль обновлён'
+        return '# Сводка\n\n- факты сверены'
+
+
+def _add_raw_page(user_dir, db_path, slug, title, keywords, md, last_seen=None):
+    idx, _ = index_mod.ensure_index(user_dir, db_path, USER)
+    pages.atomic_write_page(user_dir, slug, md)
+    idx['pages'].append({
+        'slug': slug, 'title': title, 'status': 'active',
+        'keywords': list(keywords), 'aliases': [], 'created': '2020-01-01T00:00:00',
+        'updated': last_seen or '2020-01-01T00:00:00',
+        'last_seen': last_seen or '2020-01-01T00:00:00', 'hits': 0,
+    })
+    index_mod.save_index(user_dir, idx)
+
+
+def test_reconcile_archives_stale_topic(tmp_path, db_path):
+    _configure(tmp_path, db_path, {'pages': {'archive_after_days': 1}})
+    fake = ReconcileLLM()
+    mgr = manager.WikiManager()
+    mgr.set_llm_caller(fake)
+    user_dir = _bootstrap_then(tmp_path, db_path, mgr)
+    # Темы давно не видели (last_seen 2020) и в окне нет подтверждения
+    _add_raw_page(user_dir, db_path, 'garazh', 'Гараж', ['гараж'], '# Гараж\n- старый')
+
+    result = run(mgr.reconcile(USER))
+    assert result['success'] is True
+    idx = _index_wm(db_path, user_dir)
+    assert index_mod.find_page(idx, 'garazh')['status'] == 'archived'
+    assert idx['message_count'] == 0
+    assert idx['last_reconcile'] is not None
+    # Файл архивной страницы сохраняется (п. 9.5)
+    assert pages.page_exists(user_dir, 'garazh') is True
+
+
+def test_reconcile_keeps_fresh_topic(tmp_path, db_path):
+    _configure(tmp_path, db_path, {'pages': {'archive_after_days': 90}})
+    fake = ReconcileLLM()
+    mgr = manager.WikiManager()
+    mgr.set_llm_caller(fake)
+    user_dir = _bootstrap_then(tmp_path, db_path, mgr)
+    # Свежая тема с подтверждением в окне
+    _add_raw_page(user_dir, db_path, 'garazh', 'Гараж', ['гараж'], '# Гараж',
+                  last_seen=index_mod.now_iso())
+    db.append_raw(db_path, dict(user_id=USER, chat_id=-333, message_id=1,
+                                content='Пишу про гараж опять'))
+    run(mgr.reconcile(USER))
+    idx = _index_wm(db_path, user_dir)
+    assert index_mod.find_page(idx, 'garazh')['status'] == 'active'
+
+
+def test_merge_pages(tmp_path, db_path):
+    _configure(tmp_path, db_path)
+    fake = ReconcileLLM()
+    mgr = manager.WikiManager()
+    mgr.set_llm_caller(fake)
+    user_dir = _bootstrap_then(tmp_path, db_path, mgr)
+    _add_raw_page(user_dir, db_path, 'garazh', 'Гараж', ['гараж'], '# Гараж\n- факт1')
+    _add_raw_page(user_dir, db_path, 'dacha', 'Дача', ['дача'], '# Дача\n- факт2')
+
+    result = run(mgr.merge_pages(USER, 'garazh', 'dacha'))
+    assert result['ok'] is True
+    idx = _index_wm(db_path, user_dir)
+    assert index_mod.find_page(idx, 'garazh')['status'] == 'active'
+    assert index_mod.find_page(idx, 'dacha')['status'] == 'archived'
+    # Файл slug2 сохраняется как архивная копия
+    assert pages.page_exists(user_dir, 'dacha') is True
+    # keywords объединены
+    assert 'гараж' in index_mod.find_page(idx, 'garazh')['keywords']
+    assert 'дача' in index_mod.find_page(idx, 'garazh')['keywords']
+
+
+def test_merge_pages_errors(tmp_path, db_path):
+    _configure(tmp_path, db_path)
+    mgr = manager.WikiManager()
+    user_dir = _bootstrap_then(tmp_path, db_path, mgr)
+    assert run(mgr.merge_pages(USER, 'nope', 'dacha'))['ok'] is False
+    assert run(mgr.merge_pages(USER, 'Home', 'dacha'))['ok'] is False
+    assert run(mgr.merge_pages(USER, 'dacha', 'dacha'))['ok'] is False
+
+
+def test_auto_reconcile_after_messages(tmp_path, db_path):
+    _configure(tmp_path, db_path, {'reconcile': {'every_n_messages': 2}})
+    fake = ReconcileLLM()
+    mgr = manager.WikiManager()
+    mgr.set_llm_caller(fake)
+    user_dir = _bootstrap_then(tmp_path, db_path, mgr)
+
+    _seed_distinct(db_path, 3, start_mid=1, chat=-340)
+    run(mgr._process_user(USER))
+    idx = _index_wm(db_path, user_dir)
+    # message_count достиг порога → авто-reconcile сбросил счётчик и обновил страницы
+    assert idx['last_reconcile'] is not None
+    assert idx['message_count'] == 0
+

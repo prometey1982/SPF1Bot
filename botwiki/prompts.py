@@ -105,6 +105,38 @@ def build_reactivate_prompt(template: str | None, *, slug: str, title: str,
                      raw=examples_block or "(нет новых примеров)")
 
 
+def build_reconcile_prompt(template: str | None, *, slug: str, title: str,
+                           current_md: str, target_chars: int, max_chars: int,
+                           window_block: str, mentions_block: str) -> str:
+    """Промпт reconcile: сверка страницы с окном raw и упоминаниями (п. 9.6)."""
+    body = template or (
+        "Сверь страницу «{title}» ({slug}) пользователя с данными ниже.\n"
+        "Выведи ТОЛЬКО новый markdown страницы целиком (заменяющий текущий), "
+        "компактно (целевой объём ≈ {target_chars}, не более {max_chars}).\n"
+        "Правила: не удаляй факты только из-за их отсутствия в свежих данных "
+        "(долгосрочная память); при противоречии «было X / стало Y» оформляй "
+        "«ранее X, теперь Y»; не выдумывай; секреты не сохраняй."
+    ).format(slug=slug, title=title, target_chars=target_chars, max_chars=max_chars)
+    return _assemble(body, extra_context=current_md,
+                     raw=window_block or "(свежих сообщений нет)")
+
+
+def build_merge_prompt(template: str | None, *, target_slug: str, target_title: str,
+                       target_md: str, source_slug: str, source_title: str,
+                       source_md: str, max_chars: int) -> str:
+    """Промпт ручного слияния страниц (п. 13): контент slug2 вливается в slug1."""
+    body = template or (
+        "Слей две страницы пользователя: целевую «{target_title}» ({target_slug}) "
+        "и исходную «{source_title}» ({source_slug}). Верни ТОЛЬКО новый markdown "
+        "целевой страницы целиком, объединив факты без дублей, компактно "
+        "(не более {max_chars} символов)."
+    ).format(target_slug=target_slug, target_title=target_title,
+             source_slug=source_slug, source_title=source_title, max_chars=max_chars)
+    source_block = _wrap_data(f"### Исходная страница ({source_slug})\n{source_md}")
+    return _assemble(body, extra_context=f"### Текущая страница ({target_slug})\n{target_md}",
+                     raw=source_block)
+
+
 def _assemble_rules_only(instruction: str) -> str:
     rules = _DEFAULT_RULES.format(begin=DATA_BEGIN, end=DATA_END)
     return f"{rules}\n\n{instruction}"
