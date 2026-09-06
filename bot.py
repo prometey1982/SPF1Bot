@@ -910,7 +910,7 @@ def main():
 
     # Чистка user_raw (три политики ретенции, ТЗ п. 7.1) + периодическая чистка
     try:
-        botwiki.retention.cleanup_processed_raw(botwiki.config.db_path())
+        _run_raw_cleanup()
     except Exception as e:
         logger.warning("Ошибка стартовой чистки user_raw: %s", e)
     application.create_task(_periodic_raw_cleanup())
@@ -937,12 +937,24 @@ def main():
     application.run_polling()
 
 
+def _run_raw_cleanup():
+    """Стартовая/периодическая чистка user_raw (ТЗ п. 7.1).
+
+    Wiki-пользователи определяются по восстановимому индексу (п. 2.8/7.1):
+    их строки удаляются только после обработки (по watermark), у остальных —
+    no-wiki-политика, чтобы user_raw не рос бесконечно.
+    """
+    db_path = botwiki.config.db_path()
+    watermarks = botwiki.index.discover_watermarks(db_path)
+    return botwiki.retention.cleanup_processed_raw(db_path, watermarks)
+
+
 async def _periodic_raw_cleanup():
     """Периодическая чистка user_raw. Умирает вместе с event loop бота."""
     while True:
         await asyncio.sleep(RAW_CLEANUP_INTERVAL_SECONDS)
         try:
-            botwiki.retention.cleanup_processed_raw(botwiki.config.db_path())
+            _run_raw_cleanup()
         except Exception as e:
             logger.warning("Ошибка периодической чистки user_raw: %s", e)
 

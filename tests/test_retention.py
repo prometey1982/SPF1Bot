@@ -14,8 +14,6 @@ import sqlite3
 from botwiki import config as wc
 from botwiki import db, retention
 
-from conftest import configure_db
-
 U = 1001
 
 
