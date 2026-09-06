@@ -111,3 +111,53 @@ def test_truncate_md_empty():
 
 def test_oversize_note_empty_without_overflow():
     assert inject.oversize_note('Home') == ''
+
+
+def _add_topic_page(user_dir, db_path, slug='cars', title='Машины',
+                    keywords=('машина', 'авто')):
+    idx, _ = index_mod.ensure_index(user_dir, db_path, USER)
+    pages.atomic_write_page(user_dir, slug, f'# {title}\n- владеет жигулями')
+    now = index_mod.now_iso()
+    idx['pages'].append({
+        'slug': slug, 'title': title, 'status': 'active',
+        'keywords': list(keywords), 'aliases': [], 'created': now,
+        'updated': now, 'last_seen': now, 'hits': 0,
+    })
+    index_mod.save_index(user_dir, idx)
+
+
+def test_injects_topic_page_on_relevant_query(tmp_path, db_path):
+    user_dir = _bootstrap(tmp_path, db_path)
+    _add_topic_page(user_dir, db_path)
+
+    pages_sel = inject.select_pages_for_injection(db_path, USER, query='моя машина сломалась')
+    slugs = {p['slug'] for p in pages_sel}
+    assert 'Home' in slugs and 'Style' in slugs and 'cars' in slugs
+
+    # Порядок: Home, Style, затем темы
+    assert [p['slug'] for p in pages_sel] == ['Home', 'Style', 'cars']
+
+
+def test_no_topic_page_on_irrelevant_query(tmp_path, db_path):
+    user_dir = _bootstrap(tmp_path, db_path)
+    _add_topic_page(user_dir, db_path)
+    pages_sel = inject.select_pages_for_injection(db_path, USER, query='привет, как дела?')
+    assert {p['slug'] for p in pages_sel} == {'Home', 'Style'}
+
+
+def test_no_topic_page_without_query(tmp_path, db_path):
+    user_dir = _bootstrap(tmp_path, db_path)
+    _add_topic_page(user_dir, db_path)
+    pages_sel = inject.select_pages_for_injection(db_path, USER)
+    assert {p['slug'] for p in pages_sel} == {'Home', 'Style'}
+
+
+def test_big_topic_page_skipped(tmp_path, db_path):
+    user_dir = _bootstrap(tmp_path, db_path)
+    # Страница больше inject.page_max_chars (по умолчанию 1000)
+    _add_topic_page(user_dir, db_path, slug='big', title='Большая',
+                    keywords=('big', 'маркер'))
+    pages.atomic_write_page(user_dir, 'big', '# Большая\n\n' + 'x' * 2000)
+    pages_sel = inject.select_pages_for_injection(db_path, USER, query='маркер big')
+    assert 'big' not in {p['slug'] for p in pages_sel}
+

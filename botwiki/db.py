@@ -175,6 +175,29 @@ def fetch_window_rows(db_path: str, user_id: int, limit: int) -> list[dict]:
         conn.close()
 
 
+def fetch_processed_window(db_path: str, user_id: int, watermark: int,
+                           limit: int) -> list[dict]:
+    """Последние `limit` ОБРАБОТАННЫХ строк (id <= watermark) по возрастанию id.
+
+    Окно создания страниц (п. 9.4): только обработанные сообщения.
+    """
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, content, ts FROM (
+                SELECT id, content, ts FROM user_raw
+                WHERE user_id = ? AND id <= ?
+                ORDER BY id DESC LIMIT ?
+            ) ORDER BY id ASC
+            """,
+            (user_id, watermark, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def watermark(db_path: str, user_id: int) -> int | None:
     """Максимальный id строки пользователя (для bootstrap/watermark). None, если строк нет."""
     conn = connect(db_path)

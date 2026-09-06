@@ -41,6 +41,23 @@ def _seed_raw(db_path, n, start_mid=1, chat=-100, user_id=USER, content='Люб�
                                     message_id=start_mid + i, content=content))
 
 
+_DISTINCT = [
+    'Люблю пить кофе по утрам',
+    'Обсуждали электричку и расписание',
+    'Купил новые зимние колёса',
+    'Смотрю матчи по хоккею',
+    'Читаю новости про электрокары',
+    'Готовил шашлыки на даче',
+]
+
+
+def _seed_distinct(db_path, n, start_mid=1, chat=-100, user_id=USER):
+    for i in range(n):
+        db.append_raw(db_path, dict(user_id=user_id, chat_id=chat,
+                                    message_id=start_mid + i,
+                                    content=_DISTINCT[i % len(_DISTINCT)]))
+
+
 def _max_id(db_path, user_id=USER):
     return db.watermark(db_path, user_id)
 
@@ -185,14 +202,14 @@ def _bootstrap_then(tmp_path, db_path, mgr, **kw):
 
 def test_increment_updates_home_and_watermark(tmp_path, db_path):
     _configure(tmp_path, db_path)
-    _seed_raw(db_path, 2)
+    _seed_distinct(db_path, 2)
     fake = FakeLLM()
     mgr = manager.WikiManager()
     mgr.set_llm_caller(fake)
     user_dir = _bootstrap_then(tmp_path, db_path, mgr)
 
     wm_after_boot = _index_wm(db_path, user_dir)['watermark']
-    _seed_raw(db_path, 3, start_mid=100, chat=-200)  # новые строки
+    _seed_distinct(db_path, 3, start_mid=100, chat=-200)  # новые строки
 
     assert run(mgr._process_user(USER)) is True
     idx = _index_wm(db_path, user_dir)
@@ -225,7 +242,7 @@ def test_increment_snapshot_limits_no_loss(tmp_path, db_path):
     mgr.set_llm_caller(fake)
     user_dir = _bootstrap_then(tmp_path, db_path, mgr)
 
-    _seed_raw(db_path, 5, start_mid=1, chat=-300)
+    _seed_distinct(db_path, 5, start_mid=1, chat=-300)
     assert run(mgr._process_user(USER)) is True
     idx = _index_wm(db_path, user_dir)
     # 5 строк доехали несколькими снимками (2+2+1), ни одна не потеряна
@@ -363,3 +380,85 @@ def test_wiki_valid_and_find_page(tmp_path, db_path):
     idx = _index_wm(db_path, user_dir)
     assert index_mod.find_page(idx, 'Home') is not None
     assert index_mod.find_page(idx, 'Nope') is None
+
+
+class TopicLLM:
+    """Fake: маршрутизирует create/update по содержимому промпта."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def __call__(self, prompt):
+        self.calls += 1
+        if 'Предложи страницу' in prompt:
+            return (
+                'slug: garazh\n'
+                'title: Гараж\n'
+                'keywords: [гараж, гаражи]\n'
+                'aliases: [гараж-бокс]\n'
+                'content: |\n'
+                '  # Гараж\n'
+                '  - строит гараж мечты\n'
+            )
+        return '# Сводка\n\n- любит гаражи'
+
+
+def _seed_repeating(db_path, n, token='гараж', chat=-50):
+    phrases = [
+        f'Пишу про {token} мечты',
+        f'Купил {token} на окраине',
+        f'Сам строю {token} зимой',
+        f'Сдаю {token} в аренду',
+    ]
+    for i in range(n):
+        db.append_raw(db_path, dict(user_id=USER, chat_id=chat,
+                                    message_id=i + 1,
+                                    content=phrases[i % len(phrases)]))
+
+
+def test_create_topic_page_and_no_duplicate(tmp_path, db_path):
+    _configure(tmp_path, db_path)
+    fake = TopicLLM()
+    mgr = manager.WikiManager()
+    mgr.set_llm_caller(fake)
+    user_dir = _bootstrap_then(tmp_path, db_path, mgr)
+
+    # 3 повторения темы в разных сообщениях → создаётся страница
+    _seed_repeating(db_path, 3)
+    run(mgr._process_user(USER))
+    assert pages.page_exists(user_dir, 'garazh') is True
+    idx = _index_wm(db_path, user_dir)
+    page = index_mod.find_page(idx, 'garazh')
+    assert page is not None
+    assert page['status'] == 'active'
+    assert page['keywords'] == ['гараж', 'гаражи']
+
+    # Повторная тема уже покрыта активной страницей — дубль не создаётся,
+    # но снимок обновляет и Home, и саму тематическую страницу (п. 9.3).
+    calls_after_create = fake.calls
+    _seed_repeating(db_path, 3, chat=-51)
+    run(mgr._process_user(USER))
+    idx = _index_wm(db_path, user_dir)
+    assert len([p for p in idx['pages'] if p['slug'] == 'garazh']) == 1
+    assert fake.calls == calls_after_create + 2  # Home + тематическая garazh
+
+
+def test_create_topic_skipped_on_invalid_proposal(tmp_path, db_path):
+    _configure(tmp_path, db_path)
+
+    async def fake(prompt):
+        return '# Сводка\n\n- просто текст без YAML'  # невалидное предложение
+
+    mgr = manager.WikiManager()
+    mgr.set_llm_caller(fake)
+    user_dir = _bootstrap_then(tmp_path, db_path, mgr)
+
+    _seed_repeating(db_path, 3)
+    run(mgr._process_user(USER))
+    assert pages.page_exists(user_dir, 'garazh') is False
+
+    # cooldown активен → повторная попытка по тому же кандидату не выполняется
+    idx = _index_wm(db_path, user_dir)
+    cooldowns = idx.get('page_proposal_cooldowns') or {}
+    assert 'гараж' in cooldowns
+

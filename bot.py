@@ -498,7 +498,7 @@ async def get_ai_response_with_context(message_text, bot_username, chat_id, user
     # Память о пользователе (ТЗ п. 12): primary+валидная wiki → инъекция wiki;
     # иначе — dossier-фолбэк (п. 6.2).
     if user_id and config.get('use_ai', False):
-        memory_msg = _build_memory_message(user_id)
+        memory_msg = _build_memory_message(user_id, query=message_text)
         if memory_msg:
             context_messages = [memory_msg] + context_messages
 
@@ -684,7 +684,7 @@ def _try_capture_raw(message, content: str, content_type: str):
         logger.warning("Ошибка захвата raw (%s): %s", content_type, e)
 
 
-def _build_memory_message(user_id: int):
+def _build_memory_message(user_id: int, query: str | None = None):
     """System-сообщение о пользователе для ответа (wiki → dossier-фолбэк).
 
     Горячий путь: только чтение (никаких дисковых записей). Ошибки → безопасный

@@ -23,28 +23,11 @@ from . import index as index_mod
 from . import pages as pageio
 from . import prompts
 from . import inject as inject_mod
+from . import textutil
+from . import topics
+from . import router
 
 logger = logging.getLogger(__name__)
-
-STOPWORDS = {
-    'и', 'в', 'во', 'не', 'что', 'он', 'на', 'я', 'с', 'со', 'как', 'а', 'то',
-    'все', 'она', 'так', 'его', 'но', 'да', 'ты', 'к', 'у', 'же', 'вы', 'за',
-    'бы', 'по', 'только', 'ее', 'мне', 'было', 'вот', 'от', 'меня', 'еще', 'нет',
-    'о', 'из', 'ему', 'теперь', 'когда', 'даже', 'ну', 'вдруг', 'ли', 'если',
-    'уже', 'или', 'ни', 'быть', 'был', 'него', 'до', 'вас', 'нибудь', 'опять',
-    'уж', 'вам', 'ведь', 'там', 'потом', 'себя', 'ничего', 'ей', 'может', 'они',
-    'тут', 'где', 'есть', 'надо', 'ней', 'для', 'мы', 'тебя', 'их', 'чем', 'была',
-    'сам', 'чтоб', 'без', 'будто', 'чего', 'раз', 'тоже', 'себе', 'под', 'будет',
-    'ж', 'тогда', 'кто', 'этот', 'того', 'потому', 'этого', 'какой', 'совсем',
-    'ним', 'здесь', 'этом', 'один', 'почти', 'мой', 'тем', 'чтобы', 'нее', 'кажется',
-    'сейчас', 'были', 'куда', 'зачем', 'сказать', 'всех', 'никогда', 'конечно',
-    'всю', 'нету', 'при', 'об', 'хоть', 'после', 'над', 'тот', 'через', 'эти',
-    # междометия/сленг-реакции: «ок», «ага», «лол» — тривиальные (п. 8.1)
-    'ок', 'окей', 'ага', 'ахах', 'угу', 'мда', 'хм', 'ого', 'лол', 'кек', 'лан',
-    'неа', 'ауч', 'аа', 'оо', 'мм', 'эх', 'оу', 'вау',
-}
-
-TOKEN_RE = re.compile(r'[a-zа-яё]{2,}', re.IGNORECASE)
 
 DEFAULT_HOME_FRAME = "# Сводка\n\n"
 DEFAULT_STYLE_FRAME = "# Стиль\n\n"
@@ -58,24 +41,20 @@ _STYLE_TOKENS = {
 def is_trivial(content: str | None, min_chars: int = 3) -> bool:
     """Тривиальное сообщение (п. 8.1): не попадает в LLM, но считается обработанным.
 
-    Короче `min_chars` ИЛИ после нормализации/удаления стоп-слов не содержит
-    значимых токенов (только эмодзи/«ок», «ага», «лол»).
+    Короче `min_chars` ИЛИ не содержит значимых токенов (стоп-слова/эмодзи).
     """
     if not content:
         return True
-    stripped = content.strip()
-    if len(stripped) < min_chars:
+    if len(content.strip()) < min_chars:
         return True
-    tokens = [t.lower() for t in TOKEN_RE.findall(stripped)]
-    significant = [t for t in tokens if t not in STOPWORDS]
-    return not significant
+    return not textutil.tokenize(content)
 
 
 def has_style_signal(content: str | None) -> bool:
     if not content:
         return False
     lower = content.lower()
-    tokens = {t.lower() for t in TOKEN_RE.findall(lower)}
+    tokens = set(textutil.tokenize(lower))
     if tokens & _STYLE_TOKENS:
         return True
     if re.search(r'[!?]{2,}|🙂|😄|😁|🤣|😂|😏|😎|👍|🤡|😭', content):
@@ -271,9 +250,45 @@ class WikiManager:
             if not processed_ok:
                 return False  # сбой: watermark не двигался; ждём следующий триггер
             if not more:
+                # После успешной обработки снимка — детерминированное создание
+                # тематических страниц по окну обработанных строк (п. 9.4).
+                try:
+                    await self._maybe_create_topic_page(user_id, user_dir, index_data, pages_cfg)
+                except Exception as e:
+                    logger.warning("wiki: ошибка создания страниц user_id=%d: %s", user_id, e)
                 return True
 
     # --- обработка одного снимка ---
+
+    def _select_updates(self, user_dir, index_data, nontrivial,
+                        update_cfg, pages_cfg) -> list[str]:
+        """Страницы, затронутые снимком (п. 9.3): Home/Style + тематические.
+
+        Home обновляется при наличии нетривиального содержимого, Style — при
+        стилевом сигнале; тематические — по router-аффинности снимка, не более
+        `max_pages_per_update`.
+        """
+        updates: list[str] = []
+        if nontrivial:
+            updates.append('Home')
+            if any(has_style_signal(r.get('content')) for r in nontrivial):
+                updates.append('Style')
+
+            snapshot_tokens: set[str] = set()
+            for row in nontrivial:
+                snapshot_tokens |= textutil.token_set(row.get('content'))
+            scored = []
+            for page in index_data.get('pages', []):
+                slug = page.get('slug', '')
+                if slug in ('Home', 'Style') or page.get('status') != 'active':
+                    continue
+                score = router.score_query(snapshot_tokens, page)
+                if score > 0:
+                    scored.append((score, slug))
+            scored.sort(key=lambda x: (-x[0], x[1]))
+            limit = update_cfg.get('max_pages_per_update', 3)
+            updates.extend(slug for _, slug in scored[:limit])
+        return updates
 
     async def _process_batch(self, user_id, user_dir, index_data, rows,
                              update_cfg, pages_cfg) -> tuple[bool, bool]:
@@ -282,20 +297,21 @@ class WikiManager:
 
         nontrivial = [r for r in rows if not is_trivial(
             r.get('content'), update_cfg.get('trivial_min_chars', 3))]
-        to_update = [(slug, current) for slug, current in (('Home', pageio.read_page(user_dir, 'Home') or ''),
-                                                           ('Style', pageio.read_page(user_dir, 'Style') or ''))
-                     if _slug_wants_update(slug, nontrivial)]
 
+        updates = self._select_updates(user_dir, index_data, nontrivial,
+                                       update_cfg, pages_cfg)
         new_pages: dict[str, str] = {}
-        if to_update:
+        if updates:
             raw_block = _build_raw_block(nontrivial)
-            for slug, current_md in to_update:
+            for slug in updates:
+                current_md = pageio.read_page(user_dir, slug) or ''
                 page = index_mod.find_page(index_data, slug)
                 title = (page or {}).get('title', slug)
-                target = (pages_cfg.get('home_target_chars', 900)
-                          if slug == 'Home' else pages_cfg.get('style_target_chars', 600))
+                target = self._target_chars(slug, pages_cfg)
+                template_key = ('update_home_style_prompt'
+                                if slug in ('Home', 'Style') else 'update_page_prompt')
                 prompt_text = prompts.build_update_page_prompt(
-                    config.settings().get('prompts', {}).get('update_home_style_prompt'),
+                    config.settings().get('prompts', {}).get(template_key),
                     slug=slug, title=title, current_md=current_md,
                     target_chars=target, max_chars=page_max, raw_block=raw_block)
                 note = inject_mod.oversize_note(slug)
@@ -338,6 +354,166 @@ class WikiManager:
                     user_id, len(rows), len(nontrivial), max_id)
         has_more = db.count_unprocessed(config.db_path(), user_id, max_id) > 0
         return True, has_more
+
+    @staticmethod
+    def _target_chars(slug: str, pages_cfg: dict) -> int:
+        if slug == 'Home':
+            return pages_cfg.get('home_target_chars', 900)
+        if slug == 'Style':
+            return pages_cfg.get('style_target_chars', 600)
+        return pages_cfg.get('style_target_chars', 600)  # тематическая — универсальный target
+
+    # --- создание тематических страниц (п. 9.4, 9.5) ---
+
+    async def _maybe_create_topic_page(self, user_id, user_dir, index_data,
+                                       pages_cfg) -> bool:
+        """Создаёт (или реактивирует) ОДНУ тематическую страницу по окну.
+
+        Возвращает True, если что-то создано/реактивировано. Ошибки LLM не
+        роняют инкремент — пишется cooldown, попытка повторится позже.
+        """
+        settings = config.settings()
+        budgets_cfg = settings.get('budgets', {})
+        page_max = pages_cfg.get('max_page_chars', 2000)
+        max_count = pages_cfg.get('max_count', 20)
+        cooldown_hours = pages_cfg.get('create_cooldown_hours', 24)
+        max_cooldown = pages_cfg.get('max_cooldown_entries', 100)
+
+        active_count = sum(1 for p in index_data.get('pages', [])
+                           if p.get('status') == 'active')
+        if active_count >= max_count:
+            return False
+        if not self.budget.llm_budget(user_id, budgets_cfg.get('max_llm_calls_per_user_per_hour', 5)):
+            return False
+
+        watermark = index_data.get('watermark', 0)
+        window = db.fetch_processed_window(
+            config.db_path(), user_id, watermark,
+            pages_cfg.get('create_window_messages', 100))
+        if not window:
+            return False
+        candidates = topics.detect_candidates(window, pages_cfg.get('create_repeats', 3))
+        if not candidates:
+            return False
+
+        topics.prune_cooldowns(index_data, cooldown_hours, max_cooldown)
+
+        for cand in candidates:
+            token = cand['token']
+            if topics.is_cooldown_active(index_data, token, cooldown_hours):
+                continue
+            pages = index_data.get('pages', [])
+            overlap = topics.check_page_overlap(token, pages)
+
+            if overlap is not None and overlap.get('status') == 'active':
+                # Тема уже покрыта активной страницей — новая не нужна.
+                continue
+
+            examples = self._candidate_examples(window, cand, token)
+
+            if overlap is not None and overlap.get('status') == 'archived':
+                # Возврат темы: реактивируем архивную, дубль не создаём (п. 9.5).
+                ok = await self._reactivate_page(user_id, user_dir, index_data,
+                                                 overlap, examples, page_max)
+            else:
+                ok = await self._create_new_page(user_id, user_dir, index_data,
+                                                 token, cand, examples, page_max)
+            if ok:
+                return True
+            # Отклонение → cooldown (сохраняем индекс: иначе повторим попытку
+            # с тем же кандидатом на каждом проходе)
+            topics.set_cooldown(index_data, token, _page_meta_now())
+            topics.prune_cooldowns(index_data, cooldown_hours, max_cooldown)
+            if not index_mod.save_index(user_dir, index_data):
+                logger.warning("wiki: не удалось сохранить cooldown (user=%d)", user_id)
+        return False
+
+    @staticmethod
+    def _candidate_examples(window: list[dict], cand: dict, token: str) -> str:
+        """Строки окна с кандидатом-токеном (для LLM-предложения)."""
+        lines = []
+        for row in window:
+            if row['id'] not in cand['messages']:
+                continue
+            content = (row.get('content') or '').strip()
+            if token.lower() not in textutil.token_set(content):
+                continue
+            lines.append(content[:300])
+            if len(lines) >= 6:
+                break
+        return "\n".join(lines)
+
+    async def _create_new_page(self, user_id, user_dir, index_data, token, cand,
+                               examples, page_max) -> bool:
+        settings = config.settings()
+        prompts_cfg = settings.get('prompts', {})
+        prompt_text = prompts.build_create_page_prompt(
+            prompts_cfg.get('create_page_prompt'),
+            candidate=token, examples_block=examples, max_chars=page_max)
+        self.budget.consume_llm(user_id)
+        raw = await self._llm_call(prompt_text)
+        proposal = topics.parse_page_proposal(raw) if raw else None
+        if proposal is None:
+            logger.info("wiki: предложение страницы отклонено (token=%s): пустой/невалидный ответ", token)
+            return False
+        proposal['content'] = _validate_page_md(proposal['content'], page_max)
+        if proposal['content'] is None:
+            return False
+
+        # Повторная проверка пересечений уже с предложенными keywords/aliases
+        if topics.check_page_overlap(proposal['slug'], index_data.get('pages', [])) is not None:
+            logger.info("wiki: предложение пересекается с существующей страницей (%s)", proposal['slug'])
+            return False
+        if index_mod.find_page(index_data, proposal['slug']) is not None:
+            return False
+        if not pageio.atomic_write_page(user_dir, proposal['slug'], proposal['content']):
+            return False
+
+        now = _page_meta_now()
+        index_data['pages'].append({
+            'slug': proposal['slug'],
+            'title': proposal['title'],
+            'status': 'active',
+            'keywords': proposal['keywords'],
+            'aliases': proposal['aliases'],
+            'created': now,
+            'updated': now,
+            'last_seen': now,
+            'hits': 0,
+        })
+        if index_mod.save_index(user_dir, index_data):
+            logger.info("wiki: создана страница %s (token=%s, user=%d)",
+                        proposal['slug'], token, user_id)
+            return True
+        return False
+
+    async def _reactivate_page(self, user_id, user_dir, index_data, page,
+                               examples, page_max) -> bool:
+        settings = config.settings()
+        pages_cfg = settings.get('pages', {})
+        slug = page['slug']
+        current_md = pageio.read_page(user_dir, slug) or ''
+        prompt_text = prompts.build_reactivate_prompt(
+            settings.get('prompts', {}).get('update_page_prompt'),
+            slug=slug, title=page.get('title', slug), current_md=current_md,
+            examples_block=examples,
+            target_chars=pages_cfg.get('style_target_chars', 600), max_chars=page_max)
+        self.budget.consume_llm(user_id)
+        raw = await self._llm_call(prompt_text)
+        md = _validate_page_md(raw, page_max)
+        if md is None:
+            logger.info("wiki: реактивация %s отклонена (невалидный ответ)", slug)
+            return False
+        if not pageio.atomic_write_page(user_dir, slug, md):
+            return False
+        now = _page_meta_now()
+        page['status'] = 'active'
+        page['updated'] = now
+        page['last_seen'] = now
+        if index_mod.save_index(user_dir, index_data):
+            logger.info("wiki: реактивирована архивная страница %s (user=%d)", slug, user_id)
+            return True
+        return False
 
     # --- bootstrap (п. 9.7) ---
 
@@ -511,16 +687,6 @@ class WikiManager:
         else:
             logger.warning("wiki: user_id=%d сбой батча (%d/%d): %s",
                            user_id, fails, max_retries, message)
-
-
-def _slug_wants_update(slug: str, nontrivial: list[dict]) -> bool:
-    if not nontrivial:
-        return False
-    if slug == 'Home':
-        return True
-    if slug == 'Style':
-        return any(has_style_signal(r.get('content')) for r in nontrivial)
-    return False
 
 
 wiki_manager = WikiManager()

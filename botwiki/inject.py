@@ -15,6 +15,7 @@ import logging
 from . import config
 from . import index as index_mod
 from . import pages as pageio
+from . import router
 
 logger = logging.getLogger(__name__)
 
@@ -79,34 +80,39 @@ def _cut_line(line: str, room: int) -> str:
     return cut.rstrip() + '…'
 
 
-def select_pages_for_injection(db_path: str, user_id: int):
-    """Выбирает и усекает страницы wiki для ответа.
+def select_pages_for_injection(db_path: str, user_id: int, query: str | None = None):
+    """Выбирает и усекает страницы wiki для ответа (п. 12, 11).
 
     Возвращает список записей [{'slug','title','text'}] или None, если валидной
-    wiki нет (фолбэк на dossier). Не пишет на диск.
+    wiki нет (фолбэк на dossier). Тематические страницы выбирает router по
+    тексту сообщения; страница целиком только если ≤ inject.page_max_chars.
+    Не пишет на диск.
     """
     if not index_mod.wiki_valid(db_path, user_id):
         return None
 
     settings = config.settings()
     inject_cfg = settings.get('inject', {})
+    router_cfg = settings.get('router', {})
     user_dir = pageio.user_wiki_dir(user_id)
+
+    index_data, _ = index_mod.ensure_index(user_dir, db_path, user_id)
+    if index_data is None:
+        return None
 
     home_md = pageio.read_page(user_dir, 'Home') or ""
     style_md = pageio.read_page(user_dir, 'Style') or ""
 
     selected: list[dict] = []
     if inject_cfg.get('include_home', True):
-        selected.append({'slug': 'Home', 'title': 'Сводка', 'md': home_md})
+        selected.append({'slug': 'Home', 'title': 'Сводка', 'md': home_md, 'group': 'service'})
     if inject_cfg.get('include_style', True):
-        selected.append({'slug': 'Style', 'title': 'Стиль', 'md': style_md})
+        selected.append({'slug': 'Style', 'title': 'Стиль', 'md': style_md, 'group': 'service'})
 
     home_max = inject_cfg.get('home_max_chars', 900)
     style_max = inject_cfg.get('style_max_chars', 600)
-    reserve = inject_cfg.get('reserve_home_style_chars', 1500)
     total_max = inject_cfg.get('max_chars', 3000)
-
-    # Тематические страницы (этап 5) пока не выбираются.
+    page_max = inject_cfg.get('page_max_chars', 1000)
 
     # Шаг 1: индивидуальные лимиты Home/Style
     limits = {'Home': home_max, 'Style': style_max}
@@ -115,33 +121,49 @@ def select_pages_for_injection(db_path: str, user_id: int):
         _bump_oversize(item['slug'], len(item['md']), limits[item['slug']],
                        len(item['text']) < len(item['md']))
 
-    def _apply_cap(cap: int):
-        """Гарантирует суммарный размер ≤ cap; режет Style раньше Home (п. 12.3/12.5)."""
-        total = sum(len(x['text']) for x in selected)
-        if total <= cap:
-            return
-        # Порядок усечения: Style → Home (тематические на будущих этапах идут позже)
-        order = sorted(selected, key=lambda x: (x['slug'] != 'Style', x['slug'] != 'Home'))
-        for x in order:
-            others = sum(len(y['text']) for y in selected if y is not x)
-            room = max(cap - others, 0)
-            if len(x['text']) > room:
-                x['text'] = truncate_md(x['md'], room)
-                _bump_oversize(x['slug'], len(x['md']), room, True)
-            total = sum(len(y['text']) for y in selected)
-            if total <= cap:
-                break
+    # Шаг 2: тематические страницы через router (по убыванию score)
+    topics_sel = router.select_topic_pages(
+        index_data, query,
+        router_cfg.get('min_score', 0.35), router_cfg.get('top_k', 2))
+    for entry in topics_sel:
+        md = pageio.read_page(user_dir, entry['slug']) or ""
+        if len(md) > page_max:
+            logger.info("wiki inject: страница %s пропущена (длина %d > page_max %d)",
+                        entry['slug'], len(md), page_max)
+            continue  # MVP: целиком только если ≤ page_max (п. 12.4)
+        selected.append({'slug': entry['slug'], 'title': entry['title'],
+                         'md': md, 'group': 'topic', 'score': entry['score']})
 
-    # Шаг 2: Home + Style не больше reserve (урезается Style, затем Home)
-    _apply_cap(reserve)
+    service = [x for x in selected if x['group'] == 'service']
+    topics_ordered = [x for x in selected if x['group'] == 'topic']
+    # По возрастанию score — кандидаты на сброс при переполнении (п. 12.5)
+    topics_ordered.sort(key=lambda x: (x.get('score', 0), x['slug']))
 
-    # Шаг 3: итог не превышает inject.max_chars
-    _apply_cap(total_max)
+    # Home+Style уже ≤ reserve (валидация: home_max+style_max ≤ reserve).
+    service_total = sum(len(x['text']) for x in service)
+
+    # Тематические добавляются целиком, пока помещаются в inject.max_chars;
+    # не влезшие сбрасываются по возрастанию score (п. 12.4/12.5).
+    free = max(total_max - service_total, 0)
+    kept_topics: list[dict] = []
+    for item in topics_ordered:
+        md = item['md']
+        if len(md) <= free:
+            kept_topics.append(item)
+            free -= len(md)
+            item['text'] = md
+        else:
+            logger.info("wiki inject: тематическая страница %s сброшена "
+                        "(нет места в лимите)", item['slug'])
+
+    kept_topics.sort(key=lambda x: (-x.get('score', 0), x['slug']))
+    service_out = [x for x in service if x['slug'] == 'Home'] + \
+                  [x for x in service if x['slug'] == 'Style']
 
     result = []
-    for item in selected:
-        text = item.get('text') or ''
-        if not text.strip():
+    for item in service_out + kept_topics:
+        text = (item.get('text') or '').strip()
+        if not text:
             continue
         result.append({'slug': item['slug'], 'title': item['title'], 'text': text})
     return result or None
