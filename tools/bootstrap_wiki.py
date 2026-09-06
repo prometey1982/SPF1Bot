@@ -117,24 +117,25 @@ def clear_cooldowns(user_id: int, db_path: str) -> str:
 
 
 async def build_for_user(wiki_manager: manager.WikiManager, user_id: int,
-                         db_path: str, bulk: bool = False, chars: int = 0) -> str:
+                         db_path: str, bulk: bool = False, chars: int = 0,
+                         single_max: int = BULK_SINGLE_MAX_CHARS) -> str:
     user_dir = os.path.join(botwiki.config.wiki_dir(), str(user_id))
     idx, _ = index_mod.ensure_index(user_dir, db_path, user_id)
     watermark = idx.get('watermark', 0) if idx else 0
     total = db.count_rows(db_path, user_id)
 
     if idx is not None and db.count_unprocessed(db_path, user_id, watermark) == 0:
-        if _bulk_marker(idx):
-            return f"user {user_id}: wiki уже готова (bulk) — пропуск"
-        # Инкрементальная wiki собрана, но без тематических страниц — досоздаём
+        built_mode = 'bulk' if _bulk_marker(idx) else 'incremental'
+        # Темы до-создаём в обоих случаях: bulk-одиночный вызов часто кладёт всё
+        # в Home + 1-2 темы; детектор по окну дополнит остальные повторяющиеся.
         created = await wiki_manager.ensure_topic_pages(
             user_id, topic_window=BULK_TOPIC_WINDOW)
-        return f"user {user_id}: wiki готова (incremental); создано тем={created}"
+        return f"user {user_id}: wiki готова ({built_mode}); создано тем={created}"
 
     # Bulk-одиночный: только для пользователя БЕЗ wiki, чьё сырьё влезает в контекст
-    if bulk and idx is None and chars <= BULK_SINGLE_MAX_CHARS:
+    if bulk and idx is None and chars <= single_max:
         ok = await wiki_manager.build_wiki_bulk(
-            user_id, max_input_chars=BULK_SINGLE_MAX_CHARS, max_pages=BULK_MAX_PAGES)
+            user_id, max_input_chars=single_max, max_pages=BULK_MAX_PAGES)
         if ok:
             return f"user {user_id}: OK (bulk-single) | строк={total}"
         return (f"user {user_id}: bulk-single не удался — перехожу на чанкинг "
@@ -167,6 +168,10 @@ def main():
                     help='только N пользователей с наибольшим объёмом raw')
     ap.add_argument('--min-chars', type=int, default=0,
                     help='пропускать пользователей с объёмом меньше N символов')
+    ap.add_argument('--single-max-chars', type=int, default=BULK_SINGLE_MAX_CHARS,
+                    help=f'порог символов для одиночного bulk-вызова '
+                         f'(по умолчанию {BULK_SINGLE_MAX_CHARS}; при контексте ~1M токенов '
+                         f'можно поднять, напр. до 2000000)')
     ap.add_argument('--dry-run', action='store_true', help='показать план и выйти')
     ap.add_argument('--bulk', action='store_true',
                     help='офлайн bulk: один LLM-вызов на пользователя (Home+Style+темы), '
@@ -207,7 +212,7 @@ def main():
     for u, ch in wanted:
         if args.bulk:
             import math
-            mode = ('single(1 вызов)' if ch <= BULK_SINGLE_MAX_CHARS
+            mode = ('single(1 вызов)' if ch <= args.single_max_chars
                     else f'chunk(~{max(1, math.ceil(ch / BULK_CHUNK_CHARS))} вызовов)')
             print(f"  user {u}: {ch:,} симв. -> {mode}")
         else:
@@ -231,7 +236,8 @@ def main():
                 if args.clear_cooldowns:
                     print(clear_cooldowns(user_id, db_path))
                 msg = await build_for_user(mgr, user_id, db_path,
-                                           bulk=args.bulk, chars=chars)
+                                           bulk=args.bulk, chars=chars,
+                                           single_max=args.single_max_chars)
                 print(msg)
             except Exception as e:
                 print(f"user {user_id}: ИСКЛЮЧЕНИЕ {e}")

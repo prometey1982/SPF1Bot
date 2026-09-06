@@ -39,6 +39,20 @@ _STYLE_TOKENS = {
     'забей', 'жесть', 'красава', 'норм', 'кринж', 'имба', 'топ',
 }
 
+# Страницы-«про слово»: когда кандидат — функция/дискурсивное слово, LLM вместо
+# фактов пишет «пользователь использует слово X…». Такие предложения отклоняем.
+_WORD_USAGE_RE = [
+    re.compile(r'использ\w+\s+(слово|слова|фразу|фразы|лексему|выражение)', re.IGNORECASE),
+    re.compile(r'употребл\w+\s+(слово|слова|фразу|фразы)', re.IGNORECASE),
+    re.compile(r'(слово|слова|фраза|фразы|выражение)\s*«', re.IGNORECASE),
+    re.compile(r'часто\s+(пишет|использует|употребляет)', re.IGNORECASE),
+]
+
+
+def _looks_like_word_usage(title: str, content: str) -> bool:
+    hay = f"{title}\n{content}".lower()
+    return any(p.search(hay) for p in _WORD_USAGE_RE)
+
 
 def is_trivial(content: str | None, min_chars: int = 3) -> bool:
     """Тривиальное сообщение (п. 8.1): не попадает в LLM, но считается обработанным.
@@ -460,6 +474,11 @@ class WikiManager:
             token = cand['token']
             if topics.is_cooldown_active(index_data, token, cooldown_hours):
                 continue
+            # Дискурсивные слова встречаются почти в каждом сообщении — темами
+            # не являются. Порог частоты применяем только к крупным окнам: в
+            # маленьких (тест/одна тема) 100% совпадений — это реальная тема.
+            if len(window) >= 20 and cand['count'] / len(window) > 0.6:
+                continue
             pages = index_data.get('pages', [])
             overlap = topics.check_page_overlap(token, pages)
 
@@ -519,6 +538,10 @@ class WikiManager:
             logger.info("wiki: предложение страницы отклонено (token=%s): %s", token, reason)
             return False
         proposal['content'] = content
+        if _looks_like_word_usage(proposal['title'], proposal['content']):
+            logger.info("wiki: предложение страницы отклонено (token=%s): страница «про слово»",
+                        token)
+            return False
 
         # Повторная проверка пересечений уже с предложенными keywords/aliases
         if topics.check_page_overlap(proposal['slug'], index_data.get('pages', [])) is not None:

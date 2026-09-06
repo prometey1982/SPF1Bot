@@ -262,10 +262,6 @@ def _validate(cfg: dict) -> list[str]:
         bad('inject', 'page_max_chars', 'page_max_chars > max_chars')
     if n(pages, 'max_page_chars') < n(inj, 'page_max_chars'):
         bad('pages', 'max_page_chars', 'pages.max_page_chars < inject.page_max_chars')
-    if n(pages, 'home_target_chars') > n(inj, 'home_max_chars'):
-        bad('pages', 'home_target_chars', 'pages.home_target_chars > inject.home_max_chars')
-    if n(pages, 'style_target_chars') > n(inj, 'style_max_chars'):
-        bad('pages', 'style_target_chars', 'pages.style_target_chars > inject.style_max_chars')
     if n(inj, 'home_max_chars') > n(pages, 'max_page_chars'):
         bad('inject', 'home_max_chars', 'inject.home_max_chars > pages.max_page_chars')
     if n(inj, 'style_max_chars') > n(pages, 'max_page_chars'):
@@ -354,6 +350,17 @@ def _log_warnings(cfg: dict):
     if isinstance(update_cfg.get('max_batch_retries'), int) and update_cfg.get('max_batch_retries', 3) < 1:
         logger.warning("wiki.update.max_batch_retries < 1: первая же ошибка приостановит "
                        "автоапдейты пользователя")
+    pages_cfg = cfg.get('pages', {})
+    inj = cfg.get('inject', {})
+    if pages_cfg.get('home_target_chars') and inj.get('home_max_chars') and \
+            pages_cfg['home_target_chars'] > inj['home_max_chars']:
+        logger.warning("wiki: pages.home_target_chars (%d) > inject.home_max_chars (%d): "
+                       "Home генерируется крупнее, чем инжектится (в файл усечение не влияет)",
+                       pages_cfg['home_target_chars'], inj['home_max_chars'])
+    if pages_cfg.get('style_target_chars') and inj.get('style_max_chars') and \
+            pages_cfg['style_target_chars'] > inj['style_max_chars']:
+        logger.warning("wiki: pages.style_target_chars (%d) > inject.style_max_chars (%d)",
+                       pages_cfg['style_target_chars'], inj['style_max_chars'])
 
 
 def configure(top_config: dict | None) -> None:

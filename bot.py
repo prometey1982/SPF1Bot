@@ -454,13 +454,13 @@ def is_admin(user) -> bool:
     return user is not None and user.username in config.get('allowed_private_users', [])
 
 
-async def make_async_request(url, headers, data):
+async def make_async_request(url, headers, data, timeout: int = 120):
     """Асинхронно выполняет HTTP запрос"""
     loop = asyncio.get_event_loop()
     try:
         response = await loop.run_in_executor(
             None,
-            lambda: requests.post(url, headers=headers, json=data, timeout=120)
+            lambda: requests.post(url, headers=headers, json=data, timeout=timeout)
         )
         return response
     except Exception as e:
@@ -791,11 +791,13 @@ async def _call_openai_text(api_key, prompt, temperature, model: str) -> str:
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature,
-        "max_tokens": 3000,
+        # 8000: обычные апдейты выводят мало, но одиночный bulk должен уместить
+        # Home + Style + несколько тем в одном ответе.
+        "max_tokens": 8000,
         "stream": False,
     }
     try:
-        response = await make_async_request(url, headers, data)
+        response = await make_async_request(url, headers, data, timeout=600)
     except Exception as e:
         return f"Ошибка при запросе к DeepSeek: {str(e)}"
     if response.status_code == 200:
