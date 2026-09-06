@@ -296,8 +296,10 @@ def save_index(user_dir: str, index: dict) -> bool:
             yaml.safe_dump(index, f, allow_unicode=True, default_flow_style=False,
                            sort_keys=False)
         if os.path.exists(current):
-            os.replace(current, bak_path(user_dir))
-        os.replace(tmp, current)
+            if not pageio._replace_with_retry(current, bak_path(user_dir)):
+                raise OSError(f"не удалось создать бэкап {bak_path(user_dir)}")
+        if not pageio._replace_with_retry(tmp, current):
+            raise OSError(f"не удалось заменить {current}")
         return True
     except OSError as e:
         logger.error("index: не удалось сохранить %s: %s", index_path(user_dir), e)

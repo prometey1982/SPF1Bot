@@ -23,10 +23,17 @@ path traversal при чтении файлов страниц по slug из а
 import os
 import re
 import logging
+import time
 
 from . import config
 
 logger = logging.getLogger(__name__)
+
+# Сколько раз и с какой задержкой повторять финальный переименовывающий шаг
+# записи при транзиентных блокировках файла (Windows: антивирус/индексатор,
+# WinError 5 «Отказано в доступе»).
+_RENAME_ATTEMPTS = 6
+_RENAME_BASE_DELAY = 0.3
 
 # IO-безопасный slug: пригоден как имя файла и как значение в _index.yaml.
 SLUG_IO_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
@@ -94,10 +101,29 @@ def read_page(user_dir: str, slug: str) -> str | None:
         return None
 
 
+def _replace_with_retry(tmp_path: str, path: str) -> bool:
+    """os.replace(tmp, path) с повторами на транзиентные OSError (блокировки)."""
+    for attempt in range(_RENAME_ATTEMPTS):
+        try:
+            os.replace(tmp_path, path)
+            return True
+        except OSError as e:
+            if attempt < _RENAME_ATTEMPTS - 1:
+                delay = _RENAME_BASE_DELAY * (attempt + 1)
+                logger.warning("page: повторить замену %s (попытка %d/%d): %s",
+                               path, attempt + 1, _RENAME_ATTEMPTS, e)
+                time.sleep(delay)
+            else:
+                logger.warning("page: не удалось заменить %s после %d попыток: %s",
+                               path, _RENAME_ATTEMPTS, e)
+    return False
+
+
 def atomic_write_page(user_dir: str, slug: str, content: str) -> bool:
     """Атомарная запись страницы (tmp + rename в той же директории).
 
-    Возвращает True при успехе; при OSError логирует и возвращает False.
+    Возвращает True при успехе; при OSError (в т.ч. транзиентные блокировки
+    файла на Windows) — повторы; после исчерпания логирует и возвращает False.
     """
     path = page_path(user_dir, slug)
     if not path:
@@ -107,16 +133,18 @@ def atomic_write_page(user_dir: str, slug: str, content: str) -> bool:
         os.makedirs(user_dir, exist_ok=True)
         with open(tmp_path, 'w', encoding='utf-8') as f:
             f.write(content)
-        os.replace(tmp_path, path)
-        return True
+        ok = _replace_with_retry(tmp_path, path)
+        if ok:
+            return True
     except OSError as e:
         logger.warning("page: не удалось записать %s: %s", path, e)
+    finally:
         try:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
         except OSError:
             pass
-        return False
+    return False
 
 
 def list_page_slugs(user_dir: str) -> list[str]:
