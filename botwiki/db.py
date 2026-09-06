@@ -96,6 +96,85 @@ def user_ids(db_path: str) -> list[int]:
         conn.close()
 
 
+def get_dossier_text(db_path: str, user_id: int) -> str | None:
+    """Содержимое USER_INFO.dossier (легаси-досье) для bootstrap from_dossier."""
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT dossier FROM USER_INFO WHERE id = ?", (user_id,)).fetchone()
+        return row['dossier'] if row and row['dossier'] else None
+    finally:
+        conn.close()
+
+
+def fetch_unprocessed(db_path: str, user_id: int, watermark: int,
+                     max_messages: int | None = None,
+                     max_chars: int | None = None) -> list[dict]:
+    """Снимок необработанных строк (id > watermark) в лимитах снимка (ТЗ 8.1).
+
+    Берутся первые по id строки, пока не исчерпан один из лимитов.
+    """
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, user_id, username, author_name, chat_id, thread_id,
+                   message_id, content, content_type, truncated, source, ts
+            FROM user_raw
+            WHERE user_id = ? AND id > ?
+            ORDER BY id ASC
+            """,
+            (user_id, watermark),
+        ).fetchall()
+
+        result = []
+        total_chars = 0
+        for row in rows:
+            content = row['content'] or ''
+            if max_messages is not None and len(result) >= max_messages:
+                break
+            if max_chars is not None and total_chars + len(content) > max_chars:
+                break
+            result.append(dict(row))
+            total_chars += len(content)
+        return result
+    finally:
+        conn.close()
+
+
+def count_unprocessed(db_path: str, user_id: int, watermark: int) -> int:
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM user_raw WHERE user_id = ? AND id > ?",
+            (user_id, watermark)).fetchone()
+        return row['c'] if row else 0
+    finally:
+        conn.close()
+
+
+def fetch_window_rows(db_path: str, user_id: int, limit: int) -> list[dict]:
+    """Последние `limit` строк пользователя в порядке возрастания id.
+
+    Используется для bootstrap.mode=limited_window (п. 9.7).
+    """
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, content, ts FROM (
+                SELECT id, content, ts FROM user_raw
+                WHERE user_id = ?
+                ORDER BY id DESC LIMIT ?
+            ) ORDER BY id ASC
+            """,
+            (user_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def watermark(db_path: str, user_id: int) -> int | None:
     """Максимальный id строки пользователя (для bootstrap/watermark). None, если строк нет."""
     conn = connect(db_path)

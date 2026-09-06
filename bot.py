@@ -503,9 +503,10 @@ async def get_ai_response_with_context(message_text, bot_username, chat_id, user
             dossier_msg = {"role": "system", "content": f"{dossier_prefix}\n{dossier}"}
             context_messages = [dossier_msg] + context_messages
 
-    # Запускаем обновление досье (fire-and-forget)
+    # Фоновая актуализация памяти о пользователе (fire-and-forget):
+    # режимы wiki (ТЗ п. 6.1) решают, что обновлять — wiki, dossier или оба.
     if user_id and config.get('use_ai', False):
-        dossier_manager.enqueue(user_id, user_username, message_text)
+        _trigger_user_updates(user_id, user_username, message_text)
 
     # Формируем messages для LLM
     system_prompt = ai_config.get('system_prompt', 'Ты полезный ассистент. Отвечай на русском.')
@@ -684,6 +685,59 @@ def _try_capture_raw(message, content: str, content_type: str):
         logger.warning("Ошибка захвата raw (%s): %s", content_type, e)
 
 
+def _trigger_user_updates(user_id: int, user_username: str, message_text: str):
+    """После ответа пользователю запускает фоновое обновление памяти о нём.
+
+    Согласно режиму wiki (ТЗ п. 6.1): primary + валидная wiki → только wiki;
+    иначе/при битой wiki → dossier (фолбэк); shadow → wiki + dossier по флагу.
+    """
+    try:
+        mode = botwiki.config.mode()
+        if mode in ('disabled', 'capture_only'):
+            dossier_manager.enqueue(user_id, user_username, message_text)
+            return
+        if mode == 'shadow':
+            shadow_cfg = botwiki.settings().get('shadow', {})
+            botwiki.wiki_manager.enqueue(user_id)
+            if not shadow_cfg.get('disable_dossier_updates', False):
+                dossier_manager.enqueue(user_id, user_username, message_text)
+            return
+        # primary
+        valid_wiki = botwiki.index.wiki_valid(botwiki.config.db_path(), user_id)
+        if valid_wiki:
+            botwiki.wiki_manager.enqueue(user_id)   # dossier для валидной wiki не обновляется
+        else:
+            botwiki.wiki_manager.enqueue(user_id)   # bootstrap/wiki, если появятся данные
+            dossier_manager.enqueue(user_id, user_username, message_text)
+    except Exception as e:
+        logger.warning("Ошибка планирования обновления памяти user_id=%d: %s", user_id, e)
+
+
+def _maybe_enqueue_wiki_on_capture(user_id: int):
+    """Захват → постановка задачи wiki при update.responded_only: false (ТЗ 6.3)."""
+    try:
+        if botwiki.config.mode() not in ('shadow', 'primary'):
+            return
+        update_cfg = botwiki.settings().get('update', {})
+        if not update_cfg.get('responded_only', True):
+            botwiki.wiki_manager.enqueue(user_id)
+    except Exception as e:
+        logger.warning("Ошибка постановки задачи wiki user_id=%d: %s", user_id, e)
+
+
+def _setup_wiki_manager():
+    """Внедряет LLM-caller в WikiManager (провайдер/конфиг читаются на каждый вызов)."""
+    async def _wiki_llm_call(prompt: str):
+        ai_config = config.get('ai', {})
+        provider = ai_config.get('provider', 'deepseek')
+        dossier_cfg = config.get('dossier', {})
+        temperature = dossier_cfg.get('temperature', 0.1)
+        return await call_llm_raw(ai_config, [{"role": "user", "content": prompt}],
+                                  provider, temperature=temperature)
+
+    botwiki.wiki_manager.set_llm_caller(_wiki_llm_call)
+
+
 async def handle_caption_capture(update: Update, context):
     """Захват подписей медиа в user_raw. Бот на такие сообщения не отвечает.
 
@@ -696,6 +750,8 @@ async def handle_caption_capture(update: Update, context):
     if not _is_in_capture_scope(update):
         return
     _try_capture_raw(message, message.caption, 'caption')
+    if message.from_user is not None:
+        _maybe_enqueue_wiki_on_capture(message.from_user.id)
 
 
 async def handle_message(update: Update, context):
@@ -725,6 +781,7 @@ async def handle_message(update: Update, context):
     # на них не отвечает (ТЗ user_wiki_tz.md, п. 5.1.1, 9.1).
     if update.message.text is not None:
         _try_capture_raw(update.message, update.message.text, 'text')
+        _maybe_enqueue_wiki_on_capture(user.id)
 
     # Гейты реакции
     if is_group:
@@ -907,6 +964,9 @@ def main():
         application = Application.builder().token(token).build()
 
     cleanup_mentions()
+
+    # Внедряем LLM-caller в WikiManager (общий провайдер, см. call_llm_raw)
+    _setup_wiki_manager()
 
     # Чистка user_raw (три политики ретенции, ТЗ п. 7.1) + периодическая чистка
     try:

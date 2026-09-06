@@ -133,6 +133,28 @@ def is_usable_index(data) -> bool:
     return not validate_index(data)
 
 
+def service_pages_present(user_dir: str) -> bool:
+    """Существуют ли файлы Home.md и Style.md (необходимо для валидности wiki)."""
+    return all(pageio.page_exists(user_dir, slug) for slug in SERVICE_PAGES)
+
+
+def wiki_valid(db_path: str, user_id: int) -> bool:
+    """«Валидная wiki» (ТЗ 6.2): валидный/восстановимый индекс + Home.md и Style.md.
+
+    Используется в горячем пути ответа (решение dossier vs wiki), поэтому без
+    записи на диск: ensure_index read-only + проверка наличия файлов.
+    """
+    user_dir = pageio.user_wiki_dir(user_id)
+    index_data, status = ensure_index(user_dir, db_path, user_id)
+    if index_data is None:
+        return False
+    return service_pages_present(user_dir)
+
+
+def find_page(index: dict, slug: str) -> dict | None:
+    return next((p for p in index.get('pages', []) if p.get('slug') == slug), None)
+
+
 # --- Чтение ---
 
 def _read_yaml_file(path: str):

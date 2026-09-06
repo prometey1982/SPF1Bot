@@ -12,6 +12,9 @@ from . import redact as redact
 from . import retention as retention
 from . import pages as pages
 from . import index as index
+from . import prompts as prompts
+from . import manager as manager
 
 configure = config.configure
 settings = config.settings
+wiki_manager = manager.wiki_manager

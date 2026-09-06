@@ -21,9 +21,17 @@ def reset_wiki_config():
 
 @pytest.fixture
 def db_path(tmp_path):
-    """Путь к временной БД с уже созданной схемой user_raw."""
+    """Путь к временной БД со схемой user_raw и легаси-таблицей USER_INFO."""
     path = str(tmp_path / "test.db")
     botwiki.db.init_raw_table(path)
+    import sqlite3
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS USER_INFO (id INTEGER PRIMARY KEY, dossier TEXT)")
+        conn.commit()
+    finally:
+        conn.close()
     return path
 
 
