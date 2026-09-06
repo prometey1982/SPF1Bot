@@ -10,6 +10,8 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
 from telegram.request import BaseRequest, HTTPXRequest
 
+import botwiki
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
 logger = logging.getLogger(__name__)
 
@@ -193,6 +195,10 @@ chat_context = ChatContext(max_context_length=15, ttl_hours=24)
 
 config = load_config()
 
+# wiki-конфигурация мёржится поверх дефолтов; невалидная секция `wiki:` не
+# даёт боту стартовать молча (валидация ТЗ user_wiki_tz.md, п. 5.2).
+botwiki.configure(config)
+
 
 # --- Database ---
 
@@ -223,6 +229,9 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_mentions_timestamp
         ON user_mentions (timestamp)
     ''')
+    # Сырьё для wiki пользователя (ТЗ user_wiki_tz.md, п. 7.1)
+    for statement in botwiki.db.USER_RAW_DDL:
+        conn.execute(statement)
     conn.commit()
     conn.close()
 
@@ -623,6 +632,72 @@ async def get_openai_compatible_response(ai_config, messages, provider_name, tem
         return f"Ошибка при запросе к {cfg['error_name']}: {str(e)}"
 
 
+# --- Захват сырья wiki (ТЗ user_wiki_tz.md, п. 9.1) ---
+
+# Интервал периодической чистки user_raw (п. 7.1: стартовая + периодическая)
+RAW_CLEANUP_INTERVAL_SECONDS = 6 * 3600
+
+def _is_in_capture_scope(update: Update) -> bool:
+    """Сообщение находится в разрешённом для захвата месте (тред/приват)."""
+    message = update.message
+    if message is None:
+        return False
+    if message.chat.type in ('group', 'supergroup'):
+        return getattr(message, 'message_thread_id', None) in config.get('allowed_group_chat_ids', [])
+    user = message.from_user
+    return user is not None and user.username in config.get('allowed_private_users', [])
+
+
+def _try_capture_raw(message, content: str, content_type: str):
+    """Захват одного текста/caption в user_raw. Никогда не бросает исключений.
+
+    Вызывается в горячем пути ответа: дешёвый синхронный INSERT OR IGNORE,
+    ошибки только логируются (захват не должен ронять обработку сообщения).
+    """
+    try:
+        if not botwiki.config.capture_active():
+            return
+        wiki_cfg = botwiki.settings()
+        capture_cfg = wiki_cfg.get('capture', {})
+        include_key = 'include_captions' if content_type == 'caption' else 'include_text'
+        if not capture_cfg.get(include_key, True):
+            return
+
+        user = message.from_user
+        if user is None or user.id is None:
+            return
+        row = botwiki.capture.build_live_row(
+            capture_cfg,
+            user_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            chat_id=message.chat_id,
+            thread_id=getattr(message, 'message_thread_id', None),
+            message_id=message.message_id,
+            content=content,
+            content_type=content_type,
+        )
+        if row:
+            botwiki.db.append_raw(botwiki.config.db_path(), row)
+    except Exception as e:
+        logger.warning("Ошибка захвата raw (%s): %s", content_type, e)
+
+
+async def handle_caption_capture(update: Update, context):
+    """Захват подписей медиа в user_raw. Бот на такие сообщения не отвечает.
+
+    Текущий ответный обработчик слушает только filters.TEXT, поэтому captions
+    обрабатываются отдельным лёгким хендлером без влияния на логику ответов.
+    """
+    message = update.message
+    if message is None or message.caption is None:
+        return
+    if not _is_in_capture_scope(update):
+        return
+    _try_capture_raw(message, message.caption, 'caption')
+
+
 async def handle_message(update: Update, context):
     """Единый обработчик сообщений для групп и личных чатов"""
     if update.message is None:
@@ -641,7 +716,18 @@ async def handle_message(update: Update, context):
         allowed_chat_ids = config.get('allowed_group_chat_ids', [])
         if message_thread_id not in allowed_chat_ids:
             return
+    else:
+        if user.username not in config.get('allowed_private_users', []):
+            return
 
+    # Захват сырья для wiki — после проверки доступа, ДО гейтов реакции:
+    # в разрешённых тредах копятся сообщения всех участников, даже если бот
+    # на них не отвечает (ТЗ user_wiki_tz.md, п. 5.1.1, 9.1).
+    if update.message.text is not None:
+        _try_capture_raw(update.message, update.message.text, 'text')
+
+    # Гейты реакции
+    if is_group:
         always_respond = config.get('always_respond_to_users', [])
         mentioned = is_bot_mentioned(update.message.text, bot_username)
         replied_to_bot = (
@@ -649,9 +735,6 @@ async def handle_message(update: Update, context):
             update.message.reply_to_message.from_user.id == context.bot.id
         )
         if not (mentioned or replied_to_bot or user.username in always_respond):
-            return
-    else:
-        if user.username not in config.get('allowed_private_users', []):
             return
 
     # Формирование сообщения
@@ -717,6 +800,7 @@ async def reload_config_command(update: Update, context):
 
         global config
         config = load_config()
+        botwiki.configure(config)  # невалидная секция wiki: ❌, конфиг не применяется
         await send_long_message(update, "✅ Конфигурация перезагружена!", parse_mode='Markdown')
     except Exception as e:
         await send_long_message(update, f"❌ Ошибка: {str(e)}", parse_mode='Markdown')
@@ -824,10 +908,22 @@ def main():
 
     cleanup_mentions()
 
+    # Чистка user_raw (три политики ретенции, ТЗ п. 7.1) + периодическая чистка
+    try:
+        botwiki.retention.cleanup_processed_raw(botwiki.config.db_path())
+    except Exception as e:
+        logger.warning("Ошибка стартовой чистки user_raw: %s", e)
+    application.create_task(_periodic_raw_cleanup())
+
     # Обработчики сообщений
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
         handle_message
+    ))
+    # Подписи медиа — только захват в wiki-сырьё (ответная логика их не касается)
+    application.add_handler(MessageHandler(
+        filters.CAPTION & ~filters.COMMAND,
+        handle_caption_capture
     ))
 
     # Команды
@@ -839,6 +935,16 @@ def main():
 
     logger.info("Бот запущен с поддержкой контекста!")
     application.run_polling()
+
+
+async def _periodic_raw_cleanup():
+    """Периодическая чистка user_raw. Умирает вместе с event loop бота."""
+    while True:
+        await asyncio.sleep(RAW_CLEANUP_INTERVAL_SECONDS)
+        try:
+            botwiki.retention.cleanup_processed_raw(botwiki.config.db_path())
+        except Exception as e:
+            logger.warning("Ошибка периодической чистки user_raw: %s", e)
 
 
 if __name__ == "__main__":

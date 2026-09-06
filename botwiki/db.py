@@ -1,0 +1,178 @@
+"""Слой БД для сырья wiki (таблица user_raw, ТЗ п. 7.1).
+
+Захват — дешёвый синхронный `INSERT OR IGNORE`. Никакого ORM: как и в bot.py,
+свежее соединение на вызов. Все функции принимают `db_path` явно (тест-френдли);
+bot.py передаёт путь из своего конфига.
+"""
+
+import sqlite3
+import logging
+
+logger = logging.getLogger(__name__)
+
+USER_RAW_DDL = [
+    """
+    CREATE TABLE IF NOT EXISTS user_raw (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      username TEXT,
+      author_name TEXT,
+      chat_id INTEGER NOT NULL,
+      thread_id INTEGER,
+      message_id INTEGER NOT NULL,
+      content TEXT,
+      content_type TEXT DEFAULT 'text',
+      truncated INTEGER DEFAULT 0,
+      source TEXT NOT NULL DEFAULT 'live',
+      inserted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      ts DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_raw_user_ts ON user_raw(user_id, ts)",
+    "CREATE INDEX IF NOT EXISTS idx_raw_ts ON user_raw(ts)",
+    "CREATE INDEX IF NOT EXISTS idx_raw_user_id ON user_raw(user_id, id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_unique_message ON user_raw(chat_id, message_id)",
+]
+
+
+def init_raw_table(db_path: str) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        for statement in USER_RAW_DDL:
+            conn.execute(statement)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def connect(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def append_raw(db_path: str, row: dict) -> bool:
+    """Вставляет строку raw (INSERT OR IGNORE). Возвращает True, если вставлено."""
+    conn = connect(db_path)
+    try:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO user_raw
+                (user_id, username, author_name, chat_id, thread_id, message_id,
+                 content, content_type, truncated, source)
+            VALUES
+                (:user_id, :username, :author_name, :chat_id, :thread_id, :message_id,
+                 :content, :content_type, :truncated, :source)
+            """,
+            {
+                'user_id': row.get('user_id'),
+                'username': row.get('username'),
+                'author_name': row.get('author_name'),
+                'chat_id': row.get('chat_id'),
+                'thread_id': row.get('thread_id'),
+                'message_id': row.get('message_id'),
+                'content': row.get('content'),
+                'content_type': row.get('content_type', 'text'),
+                'truncated': int(bool(row.get('truncated', 0))),
+                'source': row.get('source', 'live'),
+            },
+        )
+        conn.commit()
+        inserted = cursor.rowcount > 0
+        if not inserted:
+            logger.info("raw: строка пропущена (дубль chat_id=%s message_id=%s)",
+                        row.get('chat_id'), row.get('message_id'))
+        return inserted
+    finally:
+        conn.close()
+
+
+def user_ids(db_path: str) -> list[int]:
+    conn = connect(db_path)
+    try:
+        rows = conn.execute("SELECT DISTINCT user_id FROM user_raw").fetchall()
+        return [r['user_id'] for r in rows]
+    finally:
+        conn.close()
+
+
+def watermark(db_path: str, user_id: int) -> int | None:
+    """Максимальный id строки пользователя (для bootstrap/watermark). None, если строк нет."""
+    conn = connect(db_path)
+    try:
+        row = conn.execute("SELECT MAX(id) AS max_id FROM user_raw WHERE user_id = ?",
+                           (user_id,)).fetchone()
+        return row['max_id'] if row is not None else None
+    finally:
+        conn.close()
+
+
+def count_rows(db_path: str, user_id: int, source: str | None = None) -> int:
+    conn = connect(db_path)
+    try:
+        if source is not None:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM user_raw WHERE user_id = ? AND source = ?",
+                (user_id, source)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM user_raw WHERE user_id = ?", (user_id,)).fetchone()
+        return row['c'] if row else 0
+    finally:
+        conn.close()
+
+
+def delete_rows(db_path: str, user_id: int, *, older_than_hours: int | None = None,
+                ts_or_inserted: str = 'ts', source: str | None = 'live') -> int:
+    """Удаляет строки пользователя; фильтр по возрасту и/или source. Возвращает число удалённых."""
+    conn = connect(db_path)
+    try:
+        clauses = ["user_id = ?"]
+        params: list = [user_id]
+        if older_than_hours is not None:
+            if ts_or_inserted not in ('ts', 'inserted_at'):
+                raise ValueError(f"ts_or_inserted должен быть ts|inserted_at, а не {ts_or_inserted!r}")
+            clauses.append(f"{ts_or_inserted} < datetime('now', ?)")
+            params.append(f"-{int(older_than_hours)} hours")
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(source)
+        cursor = conn.execute(
+            f"DELETE FROM user_raw WHERE {' AND '.join(clauses)}", params)
+        conn.commit()
+        return cursor.rowcount or 0
+    finally:
+        conn.close()
+
+
+def trim_rows(db_path: str, user_id: int, max_rows: int, source: str | None = 'live') -> int:
+    """Оставляет у пользователя не более max_rows строк (самые новые по id).
+
+    Удаляет самые старые. Возвращает число удалённых.
+    """
+    conn = connect(db_path)
+    try:
+        total = count_rows(db_path, user_id, source=source)
+        excess = total - max_rows
+        if excess <= 0:
+            return 0
+        where = "user_id = ?"
+        params: list = [user_id]
+        if source is not None:
+            where += " AND source = ?"
+            params.append(source)
+        cursor = conn.execute(
+            f"""
+            DELETE FROM user_raw WHERE id IN (
+                SELECT id FROM user_raw
+                WHERE {where}
+                ORDER BY id ASC
+                LIMIT ?
+            )
+            """,
+            params + [excess],
+        )
+        conn.commit()
+        return cursor.rowcount or 0
+    finally:
+        conn.close()

@@ -63,6 +63,132 @@ mentions:
   ttl_hours: 24         # Время жизни цитаты (часы)
 
 
+# Персональная wiki пользователя (ТЗ docs/user_wiki_tz.md).
+# Секция необязательна: без неё используются значения по умолчанию (ниже).
+# enabled: false эквивалентно mode: disabled (приоритет над mode).
+# ВАЖНО: historically allowed_group_chat_ids хранит ID топиков форума (топик —
+# это message_thread_id), а не chat_id. Захват работает по тем же спискам.
+wiki:
+  enabled: true
+  dir: wiki
+  mode: primary               # disabled | capture_only | shadow | primary
+
+  shadow:
+    disable_dossier_updates: false   # актуально для mode: shadow
+
+  capture:
+    include_text: true
+    include_captions: true
+    include_service_messages: false
+    include_bot_commands: false
+    max_content_chars: 4000
+    redact: true                     # маска phone/email при захвате
+    redact_patterns: [phone, email]
+
+  update:
+    responded_only: true
+    min_interval_seconds: 60
+    debounce_seconds: 20
+    max_pages_per_update: 3
+    max_raw_messages_per_update: 50
+    max_raw_chars_per_update: 20000
+    skip_trivial_messages: true
+    trivial_min_chars: 3
+    max_batch_retries: 3
+    on_persistent_failure: pause     # pause | retry_later | drop_old
+
+  pages:
+    start: [Home, Style]
+    max_page_chars: 2000
+    home_target_chars: 900
+    style_target_chars: 600
+    create_repeats: 3
+    create_window_messages: 100
+    create_cooldown_hours: 24
+    max_cooldown_entries: 100
+    max_count: 20
+    slug_pattern: "^[a-z0-9_-]{1,64}$"
+    archive_after_days: 90
+
+  bootstrap:
+    mode: from_dossier       # from_dossier | current_watermark | limited_window | from_import
+    limited_window_messages: 50
+    max_dossier_chars: 8000
+    sanitize_dossier: true
+
+  reconcile:
+    every_n_messages: 100
+    include_mentions: true
+    stale_fact_days: 90
+    window_messages: 300
+    max_raw_chars: 100000
+    max_mentions: 50
+    max_pages_per_reconcile: 10
+
+  router:
+    mode: keywords           # keywords | llm
+    normalize: true
+    lemmatize: false
+    min_score: 0.35
+    top_k: 2
+    llm_close_score_delta: 0.1
+    llm_timeout_ms: 800
+
+  inject:
+    max_chars: 3000
+    reserve_home_style_chars: 1500
+    home_max_chars: 900
+    style_max_chars: 600
+    page_max_chars: 1000
+    include_home: true       # для валидной wiki всегда true
+    include_style: true
+
+  raw:
+    ttl_hours: 168
+    no_wiki_ttl_hours: 72        # пользователи без wiki чистятся по этой политике
+    max_rows_per_user: 500
+    delete_only_processed: true
+    delete_unprocessed_without_wiki: true
+    import_ttl_hours: 720
+    import_ttl_basis: inserted_at     # inserted_at | ts
+    import_uncovered_max_days: 30
+
+  budgets:
+    max_updates_per_user_per_day: 20
+    max_llm_calls_per_user_per_hour: 5
+    router_llm_calls_per_user_per_hour: 30
+    reconcile_llm_calls_per_user_per_day: 20
+    allow_manual_reconcile_over_budget: true
+    import_updates_per_user_per_day: 100
+    import_llm_calls_per_user_per_day: 200
+    import_allow_over_normal_budget: true
+    max_concurrent_backfills: 3
+    over_limit_policy: delay       # delay | drop_old
+    max_backlog_messages: 300
+
+  import:                        # импорт экспорта Telegram (этап 8)
+    enabled: true
+    allowed_dir: data/imports    # чтение файлов экспорта только отсюда
+    chat_map: []                 # [{name|export_id: ..., chat_id: -100..., thread_id: 42|None}]
+    batch_size: 500
+    max_file_mb: 200
+    warn_file_mb: 100
+    on_batch_error: stop         # stop | continue
+    max_content_chars: 4000
+    redact: true
+    exclude_types: [service]
+    skip_commands: true
+    backfill_budget_mode: separate   # separate | normal | bypass
+    backfill_window_messages: 2000
+    max_backfill_messages_per_user: null
+
+  prompts:
+    update_home_style_prompt: ""
+    update_page_prompt: ""
+    create_page_prompt: ""
+    reconcile_prompt: ""
+
+
 # Настройки нейросети
 ai:
   provider: "deepseek"

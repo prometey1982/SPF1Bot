@@ -1,4 +1,8 @@
-config.yaml 
+config.yaml
+bot.db
+telegram_data*.json
+wiki/
+data/
 *.pyc
 __pycache__/
 *.o
