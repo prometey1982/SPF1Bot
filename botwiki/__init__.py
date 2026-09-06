@@ -19,6 +19,7 @@ from . import router as router
 from . import topics as topics
 from . import manager as manager
 from . import admin as admin
+from . import export_import as export_import
 
 configure = config.configure
 settings = config.settings

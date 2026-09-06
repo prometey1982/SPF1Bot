@@ -633,3 +633,24 @@ def test_wiki_valid_and_find_page_empty(tmp_path, db_path):
     _configure(tmp_path, db_path)
     assert index_mod.wiki_valid(db_path, USER) is False
 
+
+def test_backfill_user_after_import(tmp_path, db_path):
+    """backfill: новая wiki (from_import, wm=0) + drain всех импортированных строк."""
+    _configure(tmp_path, db_path)
+    fake = ReconcileLLM()
+    mgr = manager.WikiManager()
+    mgr.set_llm_caller(fake)
+    user_dir = os.path.join(wc.wiki_dir(), str(USER))
+    for mid in range(3):
+        db.insert_export_row(db_path, dict(user_id=USER, chat_id=-800,
+                                           message_id=mid + 1,
+                                           content='Расскажи про гараж и колёса',
+                                           content_type='text'), None)
+    assert index_mod.wiki_valid(db_path, USER) is False
+    assert run(mgr.backfill_user(USER)) is True
+    assert index_mod.wiki_valid(db_path, USER) is True
+    idx = _index_wm(db_path, user_dir)
+    assert idx['watermark'] == db.watermark(db_path, USER)
+    assert idx['message_count'] >= 3
+    assert (pages.read_page(user_dir, 'Home') or '').startswith('# Сводка')
+

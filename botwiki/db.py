@@ -87,6 +87,41 @@ def append_raw(db_path: str, row: dict) -> bool:
         conn.close()
 
 
+def insert_export_row(db_path: str, row: dict, ts: str | None) -> bool:
+    """Вставка импортированной строки (source='export') с историческим ts.
+
+    INSERT OR IGNORE по UNIQUE(chat_id, message_id); возвращает True, если вставлено.
+    """
+    conn = connect(db_path)
+    try:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO user_raw
+                (user_id, username, author_name, chat_id, thread_id, message_id,
+                 content, content_type, truncated, source, ts)
+            VALUES
+                (:user_id, :username, :author_name, :chat_id, :thread_id, :message_id,
+                 :content, :content_type, :truncated, 'export', :ts)
+            """,
+            {
+                'user_id': row.get('user_id'),
+                'username': None,
+                'author_name': row.get('author_name'),
+                'chat_id': row.get('chat_id'),
+                'thread_id': row.get('thread_id'),
+                'message_id': row.get('message_id'),
+                'content': row.get('content'),
+                'content_type': row.get('content_type', 'text'),
+                'truncated': int(bool(row.get('truncated', 0))),
+                'ts': ts,
+            },
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
 def user_ids(db_path: str) -> list[int]:
     conn = connect(db_path)
     try:

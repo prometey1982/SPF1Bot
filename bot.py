@@ -1009,6 +1009,67 @@ async def clear_wiki_command(update: Update, context):
     logger.info("clear_wiki: admin=%s user_id=%d", update.message.from_user.username, user_id)
 
 
+async def import_export_command(update: Update, context):
+    """Импорт истории из экспорта Telegram (ТЗ п. 9.8, 13)."""
+    if not is_admin(update.message.from_user):
+        return
+    settings = botwiki.config.settings()
+    import_cfg = settings.get('import', {})
+    if not import_cfg.get('enabled', True):
+        await _wiki_send(update, "Импорт отключён (wiki.import.enabled: false).")
+        return
+
+    args = context.args if context.args else []
+    if not args:
+        await _wiki_send(update,
+                         "Использование: /import_export <путь> --chat <name|export_id> "
+                         "[--dry-run] [--no-wiki]")
+        return
+    path_arg = args[0]
+    chat_key = None
+    dry_run = False
+    no_wiki = False
+    i = 1
+    while i < len(args):
+        token = args[i]
+        if token == '--chat' and i + 1 < len(args):
+            value = args[i + 1]
+            chat_key = int(value) if value.lstrip('-').isdigit() else value
+            i += 2
+            continue
+        if token == '--dry-run':
+            dry_run = True
+        elif token == '--no-wiki':
+            no_wiki = True
+        i += 1
+    if chat_key is None:
+        await _wiki_send(update, "Укажите чат: --chat <name|export_id>")
+        return
+
+    allowed_dir = import_cfg.get('allowed_dir', 'data/imports')
+    resolved, err = botwiki.export_import.resolve_allowed_path(path_arg, allowed_dir)
+    if err:
+        await _wiki_send(update, f"Путь отклонён: {err}")
+        return
+    if dry_run:
+        # Быстрый пробный прогон без записи (синхронно — статистика без backfill)
+        stats = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: botwiki.export_import.perform_import(
+                botwiki.config.db_path(), resolved, chat_key, dry_run=True))
+        await _wiki_send(update, botwiki.export_import._summary_text(stats))
+        return
+
+    text = await botwiki.export_import.job_manager.run_import(
+        resolved, chat_key, no_wiki=no_wiki)
+    await _wiki_send(update, text)
+
+
+async def import_status_command(update: Update, context):
+    if not is_admin(update.message.from_user):
+        return
+    await _wiki_send(update, botwiki.export_import.job_manager.status_text())
+
+
 async def analyze_quoted_message(quoted_message):
     """Анализирует цитируемое сообщение и возвращает информацию о нем"""
     if not quoted_message:
@@ -1118,6 +1179,8 @@ def main():
     application.add_handler(CommandHandler("reconcile_wiki", reconcile_wiki_command, filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("merge_wiki_pages", merge_wiki_pages_command, filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("clear_wiki", clear_wiki_command, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("import_export", import_export_command, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("import_status", import_status_command, filters.ChatType.PRIVATE))
 
     logger.info("Бот запущен с поддержкой контекста!")
     application.run_polling()

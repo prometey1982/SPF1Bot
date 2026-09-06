@@ -786,13 +786,60 @@ class WikiManager:
         return {'ok': True,
                 'message': f'Страница {slug2} влита в {slug1}; {slug2} архивирована.'}
 
+    # --- backfill после импорта (п. 9.8) ---
+
+    async def backfill_user(self, user_id: int) -> bool:
+        """Обрабатывает импортированные строки пользователя (bootstrap/drain).
+
+        Для новой wiki создаёт каркас с watermark=0 (mode from_import) и затем
+        докатывает ВСЕ необработанные строки снимками (без обычных бюджетов —
+        импортный backfill использует отдельные лимиты, п. 9.8). Возвращает True
+        при полном успехе.
+        """
+        settings = config.settings()
+        update_cfg = settings.get('update', {})
+        pages_cfg = settings.get('pages', {})
+        max_messages = update_cfg.get('max_raw_messages_per_update', 50)
+        max_chars = update_cfg.get('max_raw_chars_per_update', 20000)
+        db_path = config.db_path()
+        user_dir = pageio.user_wiki_dir(user_id)
+
+        index_data, _ = index_mod.ensure_index(user_dir, db_path, user_id)
+        if index_data is None:
+            if not await self._bootstrap(user_id, db_path, user_dir,
+                                         mode_override='from_import'):
+                logger.warning("backfill: bootstrap не создан (user_id=%d)", user_id)
+                return False
+
+        # Докатываем необработанные строки снимками (watermark двигается только
+        # по фактически обработанным). Бюджеты обычных автоапдейтов не действуют.
+        while True:
+            index_data, _ = index_mod.ensure_index(user_dir, db_path, user_id)
+            if index_data is None:
+                return False
+            if not index_mod.service_pages_present(user_dir):
+                self._ensure_service_frames(user_dir, index_data)
+            rows = db.fetch_unprocessed(db_path, user_id,
+                                        index_data.get('watermark', 0),
+                                        max_messages=max_messages, max_chars=max_chars)
+            if not rows:
+                return True
+            ok, more = await self._process_batch(user_id, user_dir, index_data,
+                                                 rows, update_cfg, pages_cfg)
+            if not ok:
+                logger.warning("backfill: сбой батча (user_id=%d)", user_id)
+                return False
+            if not more:
+                return True
+
     # --- bootstrap (п. 9.7) ---
 
-    async def _bootstrap(self, user_id: int, db_path: str, user_dir: str) -> bool:
+    async def _bootstrap(self, user_id: int, db_path: str, user_dir: str,
+                         mode_override: str | None = None) -> bool:
         settings = config.settings()
         boot = settings.get('bootstrap', {})
         pages_cfg = settings.get('pages', {})
-        mode = boot.get('mode', 'from_dossier')
+        mode = mode_override or boot.get('mode', 'from_dossier')
         page_max = pages_cfg.get('max_page_chars', 2000)
 
         if mode == 'limited_window':
@@ -810,6 +857,11 @@ class WikiManager:
                                    user_id)
                     return False
             watermark = window[-1]['id'] if window else 0
+        elif mode == 'from_import':
+            # Импорт экспорта: wiki стартует с watermark=0, чтобы необработанные
+            # (импортированные) строки обработались последующим drain'ом (п. 9.7).
+            watermark = 0
+            home_md = DEFAULT_HOME_FRAME
         elif mode in ('from_dossier', 'current_watermark'):
             watermark = db.watermark(db_path, user_id) or 0
             home_md = DEFAULT_HOME_FRAME
