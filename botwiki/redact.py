@@ -68,3 +68,31 @@ def default_patterns(capture_cfg: dict) -> list:
     if not capture_cfg.get('redact', True):
         return []
     return capture_cfg.get('redact_patterns', ['phone', 'email'])
+
+
+# --- Эвристика «запрещённого содержимого» для валидации страниц (ТЗ п. 10.2) ---
+
+# Сильные маркеры секретов: присваивания вида `password=...`, приватные ключи.
+_FORBIDDEN_ASSIGN_RE = re.compile(
+    r'(?i)(password|passwd|api[_-]?key|secret|token|access[_-]?key)\s*[=:]\s*\S{4,}')
+_PRIVATE_KEY_RE = re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----')
+
+
+def has_sensitive(text: str | None) -> bool:
+    """Наличие секретов/маркеров, запрещённых к сохранению в страницах.
+
+    Телефон/email (по паттернам маскировки), присваивания ключей/паролей,
+    приватные ключи. Используется для отбраковки ответов LLM при генерации
+    страниц — не для маскировки.
+    """
+    if not text:
+        return False
+    compiled_phones = _build_regexes(['phone', 'email'])
+    for regex, _ in compiled_phones:
+        if regex.search(text):
+            return True
+    if _FORBIDDEN_ASSIGN_RE.search(text):
+        return True
+    if _PRIVATE_KEY_RE.search(text):
+        return True
+    return False

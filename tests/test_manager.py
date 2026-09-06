@@ -569,3 +569,67 @@ def test_auto_reconcile_after_messages(tmp_path, db_path):
     assert idx['last_reconcile'] is not None
     assert idx['message_count'] == 0
 
+
+# --- Этап 7: качество и безопасность ---
+
+def test_secret_in_llm_output_rejected(tmp_path, db_path):
+    _configure(tmp_path, db_path)
+
+    async def fake(prompt):
+        return '# Сводка\n\n- тел +7 912 000-00-00 для связи'  # секрет → отклонено
+
+    mgr = manager.WikiManager()
+    mgr.set_llm_caller(fake)
+    user_dir = _bootstrap_then(tmp_path, db_path, mgr)
+
+    _seed_distinct(db_path, 2, start_mid=1, chat=-600)
+    wm_before = _index_wm(db_path, user_dir)['watermark']
+    assert run(mgr._process_user(USER)) is False
+    idx = _index_wm(db_path, user_dir)
+    assert idx['watermark'] == wm_before      # батч не прошёл
+    assert idx['last_error'] is not None      # ошибка зафиксирована
+    home = pages.read_page(user_dir, 'Home') or ''
+    assert '912' not in home                  # прежняя версия сохранена
+
+
+def test_bootstrap_truncates_dossier_to_max(tmp_path, db_path):
+    _configure(tmp_path, db_path, {'bootstrap': {'max_dossier_chars': 40}})
+    seen = {}
+
+    async def fake(prompt):
+        seen['prompt'] = prompt
+        return '# Сводка\n\n- сжатые факты'
+
+    mgr = manager.WikiManager()
+    mgr.set_llm_caller(fake)
+    _set_dossier(db_path, USER, 'A' * 200)
+    user_dir = os.path.join(wc.wiki_dir(), str(USER))
+    assert run(mgr._bootstrap(USER, db_path, user_dir)) is True
+    prompt = seen['prompt']
+    assert 'A' * 40 in prompt        # затравка усечена до max_dossier_chars
+    assert 'A' * 41 not in prompt
+
+
+def test_bootstrap_limited_window_failure_no_wiki(tmp_path, db_path):
+    _configure(tmp_path, db_path, {
+        'bootstrap': {'mode': 'limited_window', 'limited_window_messages': 5},
+    })
+
+    async def fake(prompt):
+        return None  # генерация окна не удалась
+
+    mgr = manager.WikiManager()
+    mgr.set_llm_caller(fake)
+    _seed_distinct(db_path, 3, start_mid=1, chat=-610)
+    user_dir = os.path.join(wc.wiki_dir(), str(USER))
+    assert run(mgr._bootstrap(USER, db_path, user_dir)) is False
+    # wiki не создаётся — пользователь остаётся в фолбэке на dossier (п. 9.7)
+    assert not os.path.exists(os.path.join(user_dir, 'Home.md'))
+    assert not os.path.exists(os.path.join(user_dir, index_mod.INDEX_FILE))
+
+
+def test_wiki_valid_and_find_page_empty(tmp_path, db_path):
+    """Валидность требует Home.md и Style.md."""
+    _configure(tmp_path, db_path)
+    assert index_mod.wiki_valid(db_path, USER) is False
+

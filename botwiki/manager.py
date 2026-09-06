@@ -26,6 +26,7 @@ from . import inject as inject_mod
 from . import textutil
 from . import topics
 from . import router
+from . import redact
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,10 @@ def _validate_page_md(md: str | None, max_chars: int) -> str | None:
         return None
     if len(md) > max_chars:
         logger.warning("wiki: ответ страницы слишком большой (%d > %d)", len(md), max_chars)
+        return None
+    # Анти-injection/приватность (п. 10.2, 10.3): секреты не сохраняются.
+    if redact.has_sensitive(md):
+        logger.warning("wiki: ответ страницы содержит запрещённые данные (секреты) — отклонён")
         return None
     return md
 

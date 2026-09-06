@@ -82,3 +82,31 @@ def test_partial_section_merges_over_defaults():
     # неупомянутые ключи остаются дефолтными
     assert wc.settings()['capture']['redact'] is True
     assert wc.settings()['mode'] == 'primary'
+
+
+def test_llm_router_mode_is_warning_not_error():
+    """router.mode=llm не блокирует старт (MVP: fallback на keywords + warning)."""
+    top = _top({'router': {'mode': 'llm'}})
+    wc.configure(top)  # не должно бросить WikiConfigError
+    assert wc.settings()['router']['mode'] == 'llm'
+
+
+def test_invalid_backfill_budget_mode_rejected():
+    top = _top({'import': {'backfill_budget_mode': 'always'}})
+    with pytest.raises(WikiConfigError):
+        wc.configure(top)
+
+
+def test_duplicate_chat_map_keys_rejected():
+    top = _top({'import': {'chat_map': [
+        {'name': 'A', 'chat_id': 1},
+        {'name': 'A', 'export_id': 2},
+    ]}})
+    with pytest.raises(WikiConfigError):
+        wc.configure(top)
+
+
+def test_drop_old_without_backlog_warns_not_raises():
+    top = _top({'budgets': {'over_limit_policy': 'drop_old', 'max_backlog_messages': 0}})
+    wc.configure(top)  # warning, не ошибка
+    assert wc.settings()['budgets']['over_limit_policy'] == 'drop_old'

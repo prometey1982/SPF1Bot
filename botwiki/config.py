@@ -296,7 +296,8 @@ def _validate(cfg: dict) -> list[str]:
         if imp.get('backfill_budget_mode') not in _backfill_budget_mode_values:
             bad('import', 'backfill_budget_mode',
                 f"ожидается одно из {_backfill_budget_mode_values}, получено {imp.get('backfill_budget_mode')!r}")
-        seen: dict = {}
+        seen_names: set = set()
+        seen_exports: set = set()
         for entry in imp.get('chat_map', []):
             if not isinstance(entry, dict):
                 bad('import', 'chat_map', f"элемент не является словарём: {entry!r}")
@@ -305,13 +306,15 @@ def _validate(cfg: dict) -> list[str]:
             export_id = entry.get('export_id')
             if name is None and export_id is None:
                 bad('import', 'chat_map', f"элемент без name и export_id: {entry!r}")
-            for key in ('name', 'export_id'):
-                val = entry.get(key)
-                if val is None:
-                    continue
-                if val in seen and seen[val] is not key:
-                    bad('import', 'chat_map', f"ключ {key}={val!r} повторяется")
-                seen[val] = key
+            # name/export_id должны быть уникальны (и не пересекаться) во всём списке
+            if name is not None:
+                if name in seen_names or name in seen_exports:
+                    bad('import', 'chat_map', f"дублирующийся ключ name={name!r}")
+                seen_names.add(name)
+            if export_id is not None:
+                if export_id in seen_exports or export_id in seen_names:
+                    bad('import', 'chat_map', f"дублирующийся ключ export_id={export_id!r}")
+                seen_exports.add(export_id)
 
     # Ретенция и импорт
     if raw.get('import_ttl_basis') not in _ttl_basis_values:
@@ -325,6 +328,28 @@ def _validate(cfg: dict) -> list[str]:
 
 _top: dict = {}
 _merged: dict = copy.deepcopy(WIKI_DEFAULTS)
+
+
+def _log_warnings(cfg: dict):
+    """Не-фатальные предупреждения о конфигурации (ТЗ п. 5.2 — warning, не ошибка)."""
+    raw = cfg.get('raw', {})
+    budgets = cfg.get('budgets', {})
+    router_cfg = cfg.get('router', {})
+    update_cfg = cfg.get('update', {})
+
+    if router_cfg.get('mode') == 'llm':
+        logger.warning("wiki.router.mode=llm: LLM-роутер не реализован в MVP — "
+                       "используется keywords-режим (создание/инъекция не ломаются)")
+    ttl = raw.get('ttl_hours')
+    if isinstance(ttl, int) and ttl < 24 and raw.get('delete_only_processed', True):
+        logger.warning("wiki.raw.ttl_hours=%d < 24: у wiki-пользователей окно raw может не "
+                       "дожить до авто-reconcile (отложенные страницы, п. 17)", ttl)
+    if budgets.get('over_limit_policy') == 'drop_old' and not budgets.get('max_backlog_messages'):
+        logger.warning("wiki.budgets: over_limit_policy=drop_old требует "
+                       "max_backlog_messages > 0 — backlog будет сброшен полностью")
+    if isinstance(update_cfg.get('max_batch_retries'), int) and update_cfg.get('max_batch_retries', 3) < 1:
+        logger.warning("wiki.update.max_batch_retries < 1: первая же ошибка приостановит "
+                       "автоапдейты пользователя")
 
 
 def configure(top_config: dict | None) -> None:
@@ -341,6 +366,7 @@ def configure(top_config: dict | None) -> None:
         raise WikiConfigError("Некорректная конфигурация wiki:\n- " + "\n- ".join(errors))
     _top = copy.deepcopy(top)
     _merged = merged
+    _log_warnings(merged)
     logger.info("wiki: конфигурация применена (mode=%s, enabled=%s)", merged.get('mode'), merged.get('enabled'))
 
 

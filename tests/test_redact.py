@@ -60,3 +60,18 @@ def test_bad_regex_ignored():
     masked, count = redact.mask_text("привет", ['['])
     assert masked == "привет"
     assert count == 0
+
+
+def test_has_sensitive_detects_secrets():
+    assert redact.has_sensitive('пиши на a@b.ru') is True
+    assert redact.has_sensitive('тел +7 (912) 000-00-00') is True
+    assert redact.has_sensitive('password=qwerty123456') is True
+    assert redact.has_sensitive('api_key: sk-1234567890abcdef') is True
+    assert redact.has_sensitive('-----BEGIN PRIVATE KEY-----\nxxxx') is True
+
+
+def test_has_sensitive_allows_normal_text():
+    assert redact.has_sensitive('# Сводка\n- любит котиков') is False
+    assert redact.has_sensitive('любит смотреть кино и читать') is False
+    assert redact.has_sensitive('') is False
+    assert redact.has_sensitive(None) is False
