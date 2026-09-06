@@ -22,6 +22,7 @@ from . import db
 from . import index as index_mod
 from . import pages as pageio
 from . import prompts
+from . import inject as inject_mod
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +298,9 @@ class WikiManager:
                     config.settings().get('prompts', {}).get('update_home_style_prompt'),
                     slug=slug, title=title, current_md=current_md,
                     target_chars=target, max_chars=page_max, raw_block=raw_block)
+                note = inject_mod.oversize_note(slug)
+                if note:
+                    prompt_text = f"{prompt_text}\n\n{note}"
                 self.budget.consume_llm(user_id)
                 md = await self._llm_call(prompt_text)
                 md = _validate_page_md(md, page_max)

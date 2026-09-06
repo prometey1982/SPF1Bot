@@ -495,13 +495,12 @@ async def get_ai_response_with_context(message_text, bot_username, chat_id, user
     # Получаем историю диалога
     context_messages = chat_context.get_context(chat_id)
 
-    # Инжектим досье в контексте, если есть
+    # Память о пользователе (ТЗ п. 12): primary+валидная wiki → инъекция wiki;
+    # иначе — dossier-фолбэк (п. 6.2).
     if user_id and config.get('use_ai', False):
-        dossier = get_dossier(user_id)
-        if dossier:
-            dossier_prefix = "Ниже перечислен набор фактов о пользователе:"
-            dossier_msg = {"role": "system", "content": f"{dossier_prefix}\n{dossier}"}
-            context_messages = [dossier_msg] + context_messages
+        memory_msg = _build_memory_message(user_id)
+        if memory_msg:
+            context_messages = [memory_msg] + context_messages
 
     # Фоновая актуализация памяти о пользователе (fire-and-forget):
     # режимы wiki (ТЗ п. 6.1) решают, что обновлять — wiki, dossier или оба.
@@ -683,6 +682,38 @@ def _try_capture_raw(message, content: str, content_type: str):
             botwiki.db.append_raw(botwiki.config.db_path(), row)
     except Exception as e:
         logger.warning("Ошибка захвата raw (%s): %s", content_type, e)
+
+
+def _build_memory_message(user_id: int):
+    """System-сообщение о пользователе для ответа (wiki → dossier-фолбэк).
+
+    Горячий путь: только чтение (никаких дисковых записей). Ошибки → безопасный
+    фолбэк на dossier; при их отсутствии — None (ответ без памяти).
+    """
+    try:
+        if botwiki.config.mode() == 'primary':
+            pages_sel = botwiki.inject.select_pages_for_injection(
+                botwiki.config.db_path(), user_id)
+            if pages_sel is not None:
+                content = botwiki.inject.build_system_message(pages_sel)
+                logger.info("wiki inject: user_id=%d страниц=%d chars=%d",
+                            user_id, len(pages_sel),
+                            sum(len(p['text']) for p in pages_sel))
+                return {"role": "system", "content": content}
+        dossier = get_dossier(user_id)
+        if dossier:
+            return {"role": "system",
+                    "content": f"Ниже перечислен набор фактов о пользователе:\n{dossier}"}
+    except Exception as e:
+        logger.warning("Ошибка подготовки памяти о пользователе %d: %s", user_id, e)
+        try:
+            dossier = get_dossier(user_id)
+            if dossier:
+                return {"role": "system",
+                        "content": f"Ниже перечислен набор фактов о пользователе:\n{dossier}"}
+        except Exception:
+            pass
+    return None
 
 
 def _trigger_user_updates(user_id: int, user_username: str, message_text: str):

@@ -10,12 +10,14 @@ import sqlite3
 import pytest
 
 import botwiki
+from botwiki import inject as inject_mod
 
 
 @pytest.fixture(autouse=True)
 def reset_wiki_config():
-    """Сбрасывает конфиг к дефолтам до каждого теста."""
+    """Сбрасывает конфиг и накопленные сигналы инъекции до каждого теста."""
     botwiki.configure({})
+    inject_mod._OVERSIZE.clear()
     yield
 
 
