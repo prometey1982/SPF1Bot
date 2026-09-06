@@ -90,20 +90,29 @@ def _build_reconcile_window(rows: list[dict], max_chars: int) -> str:
     return "\n".join(lines)
 
 
-def _validate_page_md(md: str | None, max_chars: int) -> str | None:
-    if not md:
-        return None
-    md = md.strip()
-    if not md:
-        return None
-    if len(md) > max_chars:
-        logger.warning("wiki: ответ страницы слишком большой (%d > %d)", len(md), max_chars)
-        return None
-    # Анти-injection/приватность (п. 10.2, 10.3): секреты не сохраняются.
-    if redact.has_sensitive(md):
-        logger.warning("wiki: ответ страницы содержит запрещённые данные (секреты) — отклонён")
-        return None
-    return md
+def _process_llm_page(raw, page_max: int):
+    """Валидирует ответ LLM для страницы → (markdown|None, причина|None).
+
+    Пустой/ошибка провайдера/секреты — отклонение (None). Превышение размера
+    НЕ роняет батч: ответ обрезается по границам строк до page_max (страницы всё
+    равно усекаются при инъекции до inject-лимитов), чтобы сборка сходилась.
+    """
+    text = raw if isinstance(raw, str) else ''
+    text = text.strip()
+    if not text:
+        return None, 'пустой ответ LLM'
+    if text.startswith('Ошибка'):
+        return None, f'ошибка провайдера: {text[:120]}'
+    if redact.has_sensitive(text):
+        return None, 'ответ содержит запрещённые данные (секреты)'
+    if len(text) > page_max:
+        trimmed = inject_mod.truncate_md(text, page_max).strip()
+        if not trimmed:
+            return None, f'ответ обрезан до пустоты (лимит {page_max})'
+        logger.info("wiki: ответ обрезан по лимиту %d (%d → %d симв.)",
+                    page_max, len(text), len(trimmed))
+        return trimmed, None
+    return text, None
 
 
 def _page_meta_now() -> str:
@@ -360,11 +369,11 @@ class WikiManager:
                 if note:
                     prompt_text = f"{prompt_text}\n\n{note}"
                 self.budget.consume_llm(user_id)
-                md = await self._llm_call(prompt_text)
-                md = _validate_page_md(md, page_max)
+                raw = await self._llm_call(prompt_text)
+                md, reason = _process_llm_page(raw, page_max)
                 if md is None:
                     self._record_failure(user_id, user_dir, index_data,
-                                         f"невалидный ответ LLM для {slug}")
+                                         f"невалидный ответ LLM для {slug}: {reason}")
                     return False, False
                 new_pages[slug] = md
 
@@ -498,9 +507,11 @@ class WikiManager:
         if proposal is None:
             logger.info("wiki: предложение страницы отклонено (token=%s): пустой/невалидный ответ", token)
             return False
-        proposal['content'] = _validate_page_md(proposal['content'], page_max)
-        if proposal['content'] is None:
+        content, reason = _process_llm_page(proposal['content'], page_max)
+        if content is None:
+            logger.info("wiki: предложение страницы отклонено (token=%s): %s", token, reason)
             return False
+        proposal['content'] = content
 
         # Повторная проверка пересечений уже с предложенными keywords/aliases
         if topics.check_page_overlap(proposal['slug'], index_data.get('pages', [])) is not None:
@@ -542,9 +553,9 @@ class WikiManager:
             target_chars=pages_cfg.get('style_target_chars', 600), max_chars=page_max)
         self.budget.consume_llm(user_id)
         raw = await self._llm_call(prompt_text)
-        md = _validate_page_md(raw, page_max)
+        md, reason = _process_llm_page(raw, page_max)
         if md is None:
-            logger.info("wiki: реактивация %s отклонена (невалидный ответ)", slug)
+            logger.info("wiki: реактивация %s отклонена (%s)", slug, reason)
             return False
         if not pageio.atomic_write_page(user_dir, slug, md):
             return False
@@ -677,12 +688,12 @@ class WikiManager:
                 target_chars=target, max_chars=page_max,
                 window_block=window_block, mentions_block=mentions_block)
             self.budget.consume_llm(user_id)
-            md = await self._llm_call(prompt_text)
-            md = _validate_page_md(md, page_max)
+            raw = await self._llm_call(prompt_text)
+            md, reason = _process_llm_page(raw, page_max)
             if md is None:
                 return {'success': False, 'partial': True,
-                        'message': f'Reconcile не завершён: невалидный ответ LLM для {slug}. '
-                                   'Повторите позже.'}
+                        'message': f'Reconcile не завершён: невалидный ответ LLM для {slug} '
+                                   f'({reason}). Повторите позже.'}
             new_pages[slug] = md
 
         for slug, md in new_pages.items():
@@ -757,10 +768,9 @@ class WikiManager:
             target_slug=slug1, target_title=page1.get('title', slug1), target_md=md1,
             source_slug=slug2, source_title=page2.get('title', slug2), source_md=md2,
             max_chars=page_max)
-        merged = await self._llm_call(prompt_text)
-        merged = _validate_page_md(merged, page_max)
+        merged, reason = _process_llm_page(await self._llm_call(prompt_text), page_max)
         if merged is None:
-            return {'ok': False, 'message': 'Невалидный ответ LLM при слиянии.'}
+            return {'ok': False, 'message': f'Невалидный ответ LLM при слиянии ({reason}).'}
 
         now = _page_meta_now()
         page1['status'] = 'active'
@@ -939,8 +949,8 @@ class WikiManager:
             max_chars=page_max, dossier_seed=dossier, window_block=None)
         if not prompt_text:
             return None
-        md = await self._llm_call(prompt_text)
-        return _validate_page_md(md, page_max)
+        md, _ = _process_llm_page(await self._llm_call(prompt_text), page_max)
+        return md
 
     async def _gen_home_from_window(self, raw_block: str, page_max: int) -> str | None:
         prompt_text = prompts.build_bootstrap_home_prompt(
@@ -948,8 +958,8 @@ class WikiManager:
             max_chars=page_max, dossier_seed=None, window_block=raw_block)
         if not prompt_text:
             return DEFAULT_HOME_FRAME
-        md = await self._llm_call(prompt_text)
-        return _validate_page_md(md, page_max)
+        md, _ = _process_llm_page(await self._llm_call(prompt_text), page_max)
+        return md
 
     # --- ошибки / политики исчерпания ---
 

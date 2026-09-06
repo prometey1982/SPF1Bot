@@ -763,10 +763,47 @@ def _setup_wiki_manager():
         provider = ai_config.get('provider', 'deepseek')
         dossier_cfg = config.get('dossier', {})
         temperature = dossier_cfg.get('temperature', 0.1)
+
+        # Для deepseek используем НЕ reasoning-модель: deepseek-reasoner тратит
+        # весь max_tokens на reasoning_content и возвращает пустой content —
+        # страницы не генерируются. Модель задаётся wiki.llm_model.
+        if provider == 'deepseek':
+            wiki_llm_model = botwiki.settings().get('llm_model') or 'deepseek-chat'
+            return await _call_openai_text(
+                ai_config.get('deepseek_api_key'), prompt, temperature,
+                model=wiki_llm_model)
         return await call_llm_raw(ai_config, [{"role": "user", "content": prompt}],
                                   provider, temperature=temperature)
 
     botwiki.wiki_manager.set_llm_caller(_wiki_llm_call)
+
+
+async def _call_openai_text(api_key, prompt, temperature, model: str) -> str:
+    """Прямой OpenAI-совместимый вызов для wiki (deepseek-chat и подобные).
+
+    Возвращает текст ответа или строку 'Ошибка…' (по конвенции call_llm_raw).
+    """
+    if not api_key:
+        return "Ошибка: API ключ для deepseek не настроен"
+    url = "https://api.deepseek.com/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    data = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": 3000,
+        "stream": False,
+    }
+    try:
+        response = await make_async_request(url, headers, data)
+    except Exception as e:
+        return f"Ошибка при запросе к DeepSeek: {str(e)}"
+    if response.status_code == 200:
+        try:
+            return response.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            return f"Ошибка парсинга ответа DeepSeek: {str(e)}"
+    return f"Ошибка DeepSeek API: {response.status_code} - {response.text}"
 
 
 async def handle_caption_capture(update: Update, context):

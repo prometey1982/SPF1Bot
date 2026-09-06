@@ -67,10 +67,13 @@ def check_ai_configured(top: dict) -> str | None:
 
 
 def setup_llm(top: dict):
-    """Внедряет LLM-caller в менеджер (общий провайдер, как в bot.py)."""
-    # call_llm_raw живёт в bot.py; импорт не запускает main(), но выполняет
-    # init_db()/configure со своим config.yaml — идентично рабочему окружению.
-    from bot import call_llm_raw
+    """Внедряет LLM-caller в менеджер (как bot._setup_wiki_manager).
+
+    Для deepseek использует НЕ reasoning-модель (wiki.llm_model), иначе
+    deepseek-reasoner тратит max_tokens на reasoning и возвращает пустой content.
+    """
+    # call_llm_raw / _call_openai_text живут в bot.py; импорт не запускает main().
+    from bot import call_llm_raw, _call_openai_text
 
     ai_config = top.get('ai', {})
     provider = ai_config.get('provider', 'deepseek')
@@ -78,6 +81,10 @@ def setup_llm(top: dict):
     temperature = dossier_cfg.get('temperature', 0.1)
 
     async def _call(prompt: str):
+        if provider == 'deepseek':
+            model = botwiki.settings().get('llm_model') or 'deepseek-chat'
+            return await _call_openai_text(ai_config.get('deepseek_api_key'),
+                                           prompt, temperature, model=model)
         return await call_llm_raw(ai_config, [{"role": "user", "content": prompt}],
                                   provider, temperature=temperature)
     return _call

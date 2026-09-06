@@ -72,6 +72,8 @@ wiki:
   enabled: true
   dir: wiki
   mode: primary               # disabled | capture_only | shadow | primary
+  llm_model: deepseek-chat    # модель для wiki-генерации при provider=deepseek
+                              # (не reasoner: у него content пустой из-за reasoning)
 
   shadow:
     disable_dossier_updates: false   # актуально для mode: shadow

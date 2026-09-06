@@ -22,6 +22,10 @@ WIKI_DEFAULTS = {
     'enabled': True,                 # false ≡ mode: disabled (имеет приоритет)
     'dir': 'wiki',
     'mode': 'primary',               # disabled | capture_only | shadow | primary
+    # Модель для генерации страниц wiki (без reasoning-режима: reasoner тратит
+    # весь max_tokens на reasoning_content и возвращает пустой content).
+    # Применяется только при ai.provider == 'deepseek'; null → как в ai.
+    'llm_model': 'deepseek-chat',
 
     'shadow': {
         'disable_dossier_updates': False,
