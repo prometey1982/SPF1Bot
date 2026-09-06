@@ -13,6 +13,7 @@ LLM-вызовы не выполняются здесь напрямую: bot.py
 
 import asyncio
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -417,11 +418,15 @@ class WikiManager:
     # --- создание тематических страниц (п. 9.4, 9.5) ---
 
     async def _maybe_create_topic_page(self, user_id, user_dir, index_data,
-                                       pages_cfg) -> bool:
+                                       pages_cfg, *, allow_over_budget: bool = False,
+                                       window_messages: int | None = None) -> bool:
         """Создаёт (или реактивирует) ОДНУ тематическую страницу по окну.
 
         Возвращает True, если что-то создано/реактивировано. Ошибки LLM не
         роняют инкремент — пишется cooldown, попытка повторится позже.
+
+        allow_over_budget: пропускать hourly-гейт LLM-бюджета (офлайн/backfill);
+        window_messages: переопределяет pages.create_window_messages (офлайн-история).
         """
         settings = config.settings()
         budgets_cfg = settings.get('budgets', {})
@@ -434,13 +439,15 @@ class WikiManager:
                            if p.get('status') == 'active')
         if active_count >= max_count:
             return False
-        if not self.budget.llm_budget(user_id, budgets_cfg.get('max_llm_calls_per_user_per_hour', 5)):
+        if not allow_over_budget and not self.budget.llm_budget(
+                user_id, budgets_cfg.get('max_llm_calls_per_user_per_hour', 5)):
             return False
 
         watermark = index_data.get('watermark', 0)
         window = db.fetch_processed_window(
             config.db_path(), user_id, watermark,
-            pages_cfg.get('create_window_messages', 100))
+            window_messages if window_messages is not None
+            else pages_cfg.get('create_window_messages', 100))
         if not window:
             return False
         candidates = topics.detect_candidates(window, pages_cfg.get('create_repeats', 3))
@@ -798,19 +805,25 @@ class WikiManager:
 
     # --- backfill после импорта (п. 9.8) ---
 
-    async def backfill_user(self, user_id: int) -> bool:
+    async def backfill_user(self, user_id: int, max_messages: int | None = None,
+                            max_chars: int | None = None,
+                            topic_window: int | None = None,
+                            max_topic_pages: int = 12) -> bool:
         """Обрабатывает импортированные строки пользователя (bootstrap/drain).
 
         Для новой wiki создаёт каркас с watermark=0 (mode from_import) и затем
-        докатывает ВСЕ необработанные строки снимками (без обычных бюджетов —
-        импортный backfill использует отдельные лимиты, п. 9.8). Возвращает True
-        при полном успехе.
+        докатывает ВСЕ необработанные строки снимками. Офлайн-чанкинг: большие
+        max_messages/max_chars укрупняют снимок (1 вызов на чанк). После полного
+        drain создаёт тематические страницы по повторяющимся темам окна.
+        Возвращает True при полном успехе.
         """
         settings = config.settings()
         update_cfg = settings.get('update', {})
         pages_cfg = settings.get('pages', {})
-        max_messages = update_cfg.get('max_raw_messages_per_update', 50)
-        max_chars = update_cfg.get('max_raw_chars_per_update', 20000)
+        eff_messages = max_messages if max_messages is not None else \
+            update_cfg.get('max_raw_messages_per_update', 50)
+        eff_chars = max_chars if max_chars is not None else \
+            update_cfg.get('max_raw_chars_per_update', 20000)
         db_path = config.db_path()
         user_dir = pageio.user_wiki_dir(user_id)
 
@@ -831,16 +844,160 @@ class WikiManager:
                 self._ensure_service_frames(user_dir, index_data)
             rows = db.fetch_unprocessed(db_path, user_id,
                                         index_data.get('watermark', 0),
-                                        max_messages=max_messages, max_chars=max_chars)
+                                        max_messages=eff_messages, max_chars=eff_chars)
             if not rows:
-                return True
+                break
             ok, more = await self._process_batch(user_id, user_dir, index_data,
                                                  rows, update_cfg, pages_cfg)
             if not ok:
                 logger.warning("backfill: сбой батча (user_id=%d)", user_id)
                 return False
             if not more:
-                return True
+                break
+
+        await self.ensure_topic_pages(user_id, topic_window=topic_window,
+                                      max_topic_pages=max_topic_pages)
+        return True
+
+    async def ensure_topic_pages(self, user_id: int, *, topic_window: int | None = None,
+                                 max_topic_pages: int = 12) -> int:
+        """Создаёт тематические страницы по обработанному окну (офлайн).
+
+        Используется после полного drain (backfill_user) и для уже готовой wiki
+        без тем. Возвращает число созданных/реактивированных страниц.
+        """
+        settings = config.settings()
+        pages_cfg = settings.get('pages', {})
+        db_path = config.db_path()
+        user_dir = pageio.user_wiki_dir(user_id)
+        created = 0
+        while created < max_topic_pages:
+            index_data, _ = index_mod.ensure_index(user_dir, db_path, user_id)
+            if index_data is None:
+                return created
+            made = await self._maybe_create_topic_page(
+                user_id, user_dir, index_data, pages_cfg,
+                allow_over_budget=True, window_messages=topic_window)
+            if not made:
+                break
+            created += 1
+        if created:
+            logger.info("wiki: создано тематических страниц=%d (user=%d)", created, user_id)
+        return created
+
+    # --- bulk-сборка из всей истории (офлайн, ТЗ-расширение) ---
+
+    async def build_wiki_bulk(self, user_id: int, *, max_input_chars: int | None = None,
+                              max_pages: int = 6) -> bool:
+        """Один структурный LLM-вызов по ВСЕЙ переписке → Home/Style/темы.
+
+        Вызывается только офлайн-инструментом для пользователя без wiki, чьё
+        сырьё умещается в контекст. При неудаче возвращает False (инструмент
+        переходит на чанкинг). watermark = MAX(id), message_count = все строки.
+        """
+        settings = config.settings()
+        pages_cfg = settings.get('pages', {})
+        page_max = pages_cfg.get('max_page_chars', 2000)
+        db_path = config.db_path()
+        user_dir = pageio.user_wiki_dir(user_id)
+
+        index_data, _ = index_mod.ensure_index(user_dir, db_path, user_id)
+        if index_data is not None:
+            logger.warning("bulk: у пользователя %d уже есть wiki — пропуск", user_id)
+            return False
+
+        rows = db.fetch_unprocessed(db_path, user_id, 0, max_messages=None, max_chars=None)
+        if not rows:
+            return False
+        nontrivial = [r for r in rows if not is_trivial(
+            r.get('content'), settings.get('update', {}).get('trivial_min_chars', 3))]
+        total_chars = sum(len(r.get('content') or '') for r in nontrivial)
+        if max_input_chars is not None and total_chars > max_input_chars:
+            logger.info("bulk: user=%d сырьё %d > лимит %d — нужен чанкинг",
+                        user_id, total_chars, max_input_chars)
+            return False
+
+        raw_block = _build_raw_block(nontrivial)
+        available = max(0, pages_cfg.get('max_count', 20) - 2)
+        eff_pages = max(1, min(max_pages, available))
+        home_target = pages_cfg.get('home_target_chars', 900)
+        style_target = pages_cfg.get('style_target_chars', 600)
+        prompt_text = prompts.build_bulk_prompt(
+            None, raw_block=raw_block, home_target=home_target,
+            style_target=style_target, page_max=page_max, max_pages=eff_pages)
+        self.budget.consume_llm(user_id)
+        raw_out = await self._llm_call(prompt_text)
+        proposal = topics.parse_bulk_proposal(raw_out, eff_pages) if raw_out else None
+        if proposal is None:
+            logger.warning("bulk: невалидный ответ для user=%d — чанкинг", user_id)
+            return False
+
+        # Валидация/очистка контента (секреты/размер/пустота)
+        home_md, reason = _process_llm_page(proposal['home'], page_max) if proposal['home'] else (None, None)
+        if home_md is None and not proposal['pages']:
+            logger.warning("bulk: нет валидного home и страниц (user=%d): %s", user_id, reason)
+            return False
+        style_md, _ = (_process_llm_page(proposal['style'], page_max)
+                       if proposal['style'] else (DEFAULT_STYLE_FRAME, None))
+        if style_md is None:
+            style_md = DEFAULT_STYLE_FRAME
+
+        cleaned = []
+        for page in proposal['pages']:
+            content, p_reason = _process_llm_page(page['content'], page_max)
+            if content is None:
+                logger.info("bulk: страница %s отклонена (%s)", page['slug'], p_reason)
+                continue
+            cleaned.append({**page, 'content': content})
+
+        # Запись страниц (до индекса; при неудаче — best-effort откат файлов)
+        written = []
+        writes = []
+        if home_md is None:
+            home_md = DEFAULT_HOME_FRAME
+        writes.append(('Home', home_md))
+        writes.append(('Style', style_md))
+        for page in cleaned:
+            writes.append((page['slug'], page['content']))
+        for slug, content in writes:
+            if not pageio.atomic_write_page(user_dir, slug, content):
+                for created in written:
+                    path = pageio.page_path(user_dir, created)
+                    if path and os.path.isfile(path):
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+                logger.warning("bulk: ошибка записи %s (user=%d) — откат", slug, user_id)
+                return False
+            written.append(slug)
+
+        now = _page_meta_now()
+        index_data = index_mod.new_index()
+        index_data['watermark'] = db.watermark(db_path, user_id) or 0
+        index_data['message_count'] = len(rows)
+        index_data['last_update'] = now
+        index_data['build_info'] = {'mode': 'bulk', 'at': now}
+        for slug, title in (('Home', 'Сводка'), ('Style', 'Стиль')):
+            page = index_mod._minimal_page(slug)
+            page['title'] = title
+            page['last_seen'] = now
+            index_data['pages'].append(page)
+        for page in cleaned:
+            entry = index_mod._minimal_page(page['slug'])
+            entry['title'] = page['title']
+            entry['keywords'] = page['keywords']
+            entry['aliases'] = page['aliases']
+            entry['last_seen'] = now
+            index_data['pages'].append(entry)
+
+        if not index_mod.save_index(user_dir, index_data):
+            logger.error("bulk: не удалось сохранить индекс (user=%d)", user_id)
+            return False
+        logger.info("wiki bulk: user_id=%d строк=%d страниц=%d watermark=%d",
+                    user_id, len(rows), len(index_data['pages']),
+                    index_data['watermark'])
+        return True
 
     # --- bootstrap (п. 9.7) ---
 

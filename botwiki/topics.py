@@ -154,3 +154,58 @@ def parse_page_proposal(text: str) -> dict | None:
         'aliases': [str(x) for x in (data.get('aliases') or []) if isinstance(x, str)],
         'content': content.strip(),
     }
+
+
+def parse_bulk_proposal(text: str, max_pages: int) -> dict | None:
+    """Разбирает bulk-ответ LLM {home, style, pages:[...]} (офлайн-сборка).
+
+    Возвращает {'home', 'style', 'pages': [...]} с нормализованными/дедуп.
+    Страницами, или None при невалидном ответе. Предельный размер содержимого
+    и проверка секретов выполняются вызывающим.
+    """
+    if not text:
+        return None
+    try:
+        data = yaml.safe_load(text)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    def _clean_optional(value):
+        return value.strip() if isinstance(value, str) else None
+
+    home = _clean_optional(data.get('home'))
+    style = _clean_optional(data.get('style'))
+
+    pages: list[dict] = []
+    seen_slugs: set = set()
+    seen_tokens: list[set] = []
+    for raw_page in data.get('pages') or []:
+        if not isinstance(raw_page, dict) or len(pages) >= max_pages:
+            continue
+        slug = pageio.normalize_slug(raw_page.get('slug'))
+        if slug is None or slug in seen_slugs:
+            continue
+        content = raw_page.get('content')
+        if not isinstance(content, str) or not content.strip():
+            continue
+        keywords = [str(x) for x in (raw_page.get('keywords') or []) if isinstance(x, str)]
+        aliases = [str(x) for x in (raw_page.get('aliases') or []) if isinstance(x, str)]
+        meta = set(textutil.token_set(' '.join(keywords) + ' ' + ' '.join(aliases)
+                                      + ' ' + str(raw_page.get('title') or '')))
+        if any(meta & prev for prev in seen_tokens):
+            continue  # пересекающиеся темы в одном ответе — оставляем первую
+        seen_slugs.add(slug)
+        seen_tokens.append(meta)
+        pages.append({
+            'slug': slug,
+            'title': str(raw_page.get('title') or slug),
+            'keywords': keywords,
+            'aliases': aliases,
+            'content': content.strip(),
+        })
+
+    if home is None and not pages:
+        return None
+    return {'home': home, 'style': style, 'pages': pages}
