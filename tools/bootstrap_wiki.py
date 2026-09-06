@@ -29,6 +29,14 @@ import yaml
 import botwiki
 from botwiki import db, index as index_mod, manager
 
+# Офлайн bulk (--bulk): один вызов на пользователя, если сырьё умещается в
+# контекст (оценка ~3 симв/токен); крупных делим на чанки по контексту.
+BULK_SINGLE_MAX_CHARS = 80_000     # ≤ этому — одиночный структурный вызов
+BULK_CHUNK_CHARS = 80_000          # размер чанка при крупном пользователе
+BULK_MAX_MESSAGES_PER_CALL = 100_000
+BULK_MAX_PAGES = 6
+BULK_TOPIC_WINDOW = 2_000          # окно создания тем после drain (не только хвост 100)
+
 
 def load_top_config(config_path: str | None) -> dict:
     if config_path:
@@ -90,21 +98,51 @@ def setup_llm(top: dict):
     return _call
 
 
+def _bulk_marker(idx) -> bool:
+    if not idx or not isinstance(idx.get('build_info'), dict):
+        return False
+    return idx['build_info'].get('mode') == 'bulk'
+
+
 async def build_for_user(wiki_manager: manager.WikiManager, user_id: int,
-                         db_path: str) -> str:
+                         db_path: str, bulk: bool = False, chars: int = 0) -> str:
     user_dir = os.path.join(botwiki.config.wiki_dir(), str(user_id))
     idx, _ = index_mod.ensure_index(user_dir, db_path, user_id)
     watermark = idx.get('watermark', 0) if idx else 0
-    if idx is not None and db.count_unprocessed(db_path, user_id, watermark) == 0:
-        return f"user {user_id}: wiki уже готова, необработанных строк нет — пропуск"
-
     total = db.count_rows(db_path, user_id)
-    ok = await wiki_manager.backfill_user(user_id)
+
+    if idx is not None and db.count_unprocessed(db_path, user_id, watermark) == 0:
+        if _bulk_marker(idx):
+            return f"user {user_id}: wiki уже готова (bulk) — пропуск"
+        # Инкрементальная wiki собрана, но без тематических страниц — досоздаём
+        created = await wiki_manager.ensure_topic_pages(
+            user_id, topic_window=BULK_TOPIC_WINDOW)
+        return f"user {user_id}: wiki готова (incremental); создано тем={created}"
+
+    # Bulk-одиночный: только для пользователя БЕЗ wiki, чьё сырьё влезает в контекст
+    if bulk and idx is None and chars <= BULK_SINGLE_MAX_CHARS:
+        ok = await wiki_manager.build_wiki_bulk(
+            user_id, max_input_chars=BULK_SINGLE_MAX_CHARS, max_pages=BULK_MAX_PAGES)
+        if ok:
+            return f"user {user_id}: OK (bulk-single) | строк={total}"
+        return (f"user {user_id}: bulk-single не удался — перехожу на чанкинг "
+                f"(строк={total})")
+
+    # Чанкинг / обычный инкремент
+    if bulk:
+        ok = await wiki_manager.backfill_user(
+            user_id, max_messages=BULK_MAX_MESSAGES_PER_CALL,
+            max_chars=BULK_CHUNK_CHARS, topic_window=BULK_TOPIC_WINDOW)
+        mode = 'bulk-chunk'
+    else:
+        ok = await wiki_manager.backfill_user(
+            user_id, topic_window=BULK_TOPIC_WINDOW)
+        mode = 'incremental'
     idx2, _ = index_mod.ensure_index(user_dir, db_path, user_id)
     left = (db.count_unprocessed(db_path, user_id, idx2.get('watermark', 0))
             if idx2 else total)
     state = 'OK' if ok else 'СБОЙ (см. last_error в _index.yaml)'
-    return f"user {user_id}: {state} | обработано_в_этом_запуске={total} остаток={left}"
+    return f"user {user_id}: {state} ({mode}) | обработано={total} остаток={left}"
 
 
 def main():
@@ -118,6 +156,9 @@ def main():
     ap.add_argument('--min-chars', type=int, default=0,
                     help='пропускать пользователей с объёмом меньше N символов')
     ap.add_argument('--dry-run', action='store_true', help='показать план и выйти')
+    ap.add_argument('--bulk', action='store_true',
+                    help='офлайн bulk: один LLM-вызов на пользователя (Home+Style+темы), '
+                         'крупным — чанкинг по контексту')
     ap.add_argument('--yes', action='store_true', help='не спрашивать подтверждение')
     args = ap.parse_args()
 
@@ -149,7 +190,13 @@ def main():
     print(f"Пользователей в плане: {len(wanted)}; суммарно символов raw: {total_chars:,}")
     print(f"Ориентировочно входных токенов: ~{total_chars // 3:,} (при ~3 симв/токен)")
     for u, ch in wanted:
-        print(f"  user {u}: {ch:,} симв.")
+        if args.bulk:
+            import math
+            mode = ('single(1 вызов)' if ch <= BULK_SINGLE_MAX_CHARS
+                    else f'chunk(~{max(1, math.ceil(ch / BULK_CHUNK_CHARS))} вызовов)')
+            print(f"  user {u}: {ch:,} симв. -> {mode}")
+        else:
+            print(f"  user {u}: {ch:,} симв.")
 
     if args.dry_run:
         return
@@ -164,9 +211,10 @@ def main():
     mgr.set_llm_caller(setup_llm(top))
 
     async def _run():
-        for user_id, _ch in wanted:
+        for user_id, chars in wanted:
             try:
-                msg = await build_for_user(mgr, user_id, db_path)
+                msg = await build_for_user(mgr, user_id, db_path,
+                                           bulk=args.bulk, chars=chars)
                 print(msg)
             except Exception as e:
                 print(f"user {user_id}: ИСКЛЮЧЕНИЕ {e}")

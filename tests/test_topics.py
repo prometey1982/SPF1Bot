@@ -88,3 +88,55 @@ def test_parse_page_proposal_rejects_bad():
     assert topics.parse_page_proposal('slug: cars') is None  # нет content
     assert topics.parse_page_proposal('') is None
     assert topics.parse_page_proposal(None) is None
+
+
+_BULK_YAML = """
+home: |
+  # Сводка
+  - любит машины
+style: |
+  # Стиль
+pages:
+  - slug: Cars
+    title: Машины
+    keywords: [машина, авто]
+    aliases: []
+    content: |
+      # Машины
+      - владеет жигулями
+"""
+
+
+def test_parse_bulk_proposal():
+    p = topics.parse_bulk_proposal(_BULK_YAML, max_pages=10)
+    assert p is not None
+    assert '# Сводка' in p['home']
+    assert len(p['pages']) == 1
+    assert p['pages'][0]['slug'] == 'cars'
+    assert p['pages'][0]['keywords'] == ['машина', 'авто']
+
+
+def test_parse_bulk_rejects_duplicate_and_bad():
+    yaml_text = (_BULK_YAML +
+                 "  - slug: cars\n    title: Дубль\n    content: |\n      # Дубль\n      - x\n"
+                 "  - slug: ../evil\n    title: Evil\n    content: x\n")
+    p = topics.parse_bulk_proposal(yaml_text, max_pages=10)
+    assert len(p['pages']) == 1  # дубль slug и небезопасный slug отброшены
+
+
+def test_parse_bulk_caps_pages():
+    titles = ['Космос', 'Кофе', 'Кино', 'Дача', 'Рыбалка']
+    many = "home: |\n  # Сводка\npages:\n"
+    for i in range(5):
+        many += (f"  - slug: p{i}\n    title: {titles[i]}\n    keywords: [k{i}]\n"
+                 "    content: |\n      # Т\n      - факт\n")
+    p = topics.parse_bulk_proposal(many, max_pages=3)
+    assert p is not None
+    assert len(p['pages']) == 3
+
+
+def test_parse_bulk_invalid():
+    assert topics.parse_bulk_proposal('не yaml: [', max_pages=5) is None
+    assert topics.parse_bulk_proposal('', max_pages=5) is None
+    # нет ни home, ни pages
+    assert topics.parse_bulk_proposal('style: |\n  # Стиль', max_pages=5) is None

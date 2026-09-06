@@ -654,3 +654,137 @@ def test_backfill_user_after_import(tmp_path, db_path):
     assert idx['message_count'] >= 3
     assert (pages.read_page(user_dir, 'Home') or '').startswith('# Сводка')
 
+
+_BULK_YAML = """
+home: |
+  # Сводка
+  - любит машины и гаражи
+style: |
+  # Стиль
+  - говорит про тачки
+pages:
+  - slug: garazh
+    title: Гараж
+    keywords: [гараж, машина]
+    aliases: []
+    content: |
+      # Гараж
+      - строит гараж мечты
+  - slug: coffee
+    title: Кофе
+    keywords: [кофе]
+    aliases: []
+    content: |
+      # Кофе
+      - пьёт кофе по утрам
+"""
+
+
+class BulkLLM:
+    def __init__(self, yaml_text=_BULK_YAML):
+        self.yaml_text = yaml_text
+        self.calls = 0
+
+    async def __call__(self, prompt):
+        self.calls += 1
+        return self.yaml_text
+
+
+def test_build_wiki_bulk(tmp_path, db_path):
+    _configure(tmp_path, db_path)
+    fake = BulkLLM()
+    mgr = manager.WikiManager()
+    mgr.set_llm_caller(fake)
+    user_dir = os.path.join(wc.wiki_dir(), str(USER))
+
+    _seed_distinct(db_path, 4, start_mid=1, chat=-900)
+    assert index_mod.wiki_valid(db_path, USER) is False
+    assert run(mgr.build_wiki_bulk(USER, max_input_chars=100_000, max_pages=6)) is True
+    assert fake.calls == 1
+
+    assert index_mod.wiki_valid(db_path, USER) is True
+    idx = _index_wm(db_path, user_dir)
+    assert idx['watermark'] == db.watermark(db_path, USER)
+    assert idx['message_count'] == 4
+    assert (idx.get('build_info') or {}).get('mode') == 'bulk'
+    slugs = {p['slug'] for p in idx['pages']}
+    assert {'Home', 'Style', 'garazh', 'coffee'} <= slugs
+    assert pages.page_exists(user_dir, 'garazh') is True
+
+
+def test_build_wiki_bulk_invalid_response_no_wiki(tmp_path, db_path):
+    _configure(tmp_path, db_path)
+
+    async def fake(prompt):
+        return 'просто текст без YAML'
+
+    mgr = manager.WikiManager()
+    mgr.set_llm_caller(fake)
+    _seed_distinct(db_path, 2, start_mid=1, chat=-901)
+    assert run(mgr.build_wiki_bulk(USER, max_input_chars=100_000)) is False
+    user_dir = os.path.join(wc.wiki_dir(), str(USER))
+    assert index_mod.wiki_valid(db_path, USER) is False
+
+
+def test_build_wiki_bulk_sensitive_home_rejected(tmp_path, db_path):
+    _configure(tmp_path, db_path)
+
+    async def fake(prompt):
+        return "home: |\n  # Сводка\n  - тел +7 912 000-00-00\n"  # секрет, нет pages
+
+    mgr = manager.WikiManager()
+    mgr.set_llm_caller(fake)
+    _seed_distinct(db_path, 2, start_mid=1, chat=-902)
+    assert run(mgr.build_wiki_bulk(USER, max_input_chars=100_000)) is False
+    assert index_mod.wiki_valid(db_path, USER) is False
+
+
+def test_build_wiki_bulk_skips_if_wiki_exists(tmp_path, db_path):
+    _configure(tmp_path, db_path)
+    mgr = manager.WikiManager()
+    mgr.set_llm_caller(BulkLLM())
+    _bootstrap_then(tmp_path, db_path, mgr)
+    assert run(mgr.build_wiki_bulk(USER, max_input_chars=100_000)) is False
+
+
+def test_backfill_creates_topic_pages_after_drain(tmp_path, db_path):
+    """После drain backfill создаёт тематические страницы по окну (офлайн)."""
+    _configure(tmp_path, db_path)
+    fake = TopicLLM()
+    mgr = manager.WikiManager()
+    mgr.set_llm_caller(fake)
+    user_dir = os.path.join(wc.wiki_dir(), str(USER))
+
+    _seed_repeating(db_path, 3)  # 3 повтора «гараж» в разных сообщениях
+    assert run(mgr.backfill_user(USER, max_messages=100, max_chars=50_000)) is True
+
+    assert pages.page_exists(user_dir, 'garazh') is True
+    idx = _index_wm(db_path, user_dir)
+    assert index_mod.find_page(idx, 'garazh')['status'] == 'active'
+    assert db.count_unprocessed(db_path, USER, idx['watermark']) == 0
+
+
+def test_ensure_topic_pages_for_ready_incremental_wiki(tmp_path, db_path):
+    """Готовая incremental-wiki без тем: ensure_topic_pages создаёт их."""
+    _configure(tmp_path, db_path)
+    fake = TopicLLM()
+    mgr = manager.WikiManager()
+    mgr.set_llm_caller(fake)
+    user_dir = _bootstrap_then(tmp_path, db_path, mgr)
+    _seed_repeating(db_path, 3)
+    run(mgr._process_user(USER))  # обработает строки (и создаст темы в живом пути)
+    # создадим «незатронутую» wiki вручную: сбросим темы и их файлы
+    idx = _index_wm(db_path, user_dir)
+    for p in list(idx['pages']):
+        if p['slug'] not in ('Home', 'Style'):
+            idx['pages'].remove(p)
+            path = pages.page_path(user_dir, p['slug'])
+            if path and os.path.isfile(path):
+                os.remove(path)
+    index_mod.save_index(user_dir, idx)
+    assert pages.page_exists(user_dir, 'garazh') is False
+
+    created = run(mgr.ensure_topic_pages(USER, topic_window=100))
+    assert created >= 1
+    assert pages.page_exists(user_dir, 'garazh') is True
+
