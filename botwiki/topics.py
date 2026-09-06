@@ -125,18 +125,53 @@ def set_cooldown(index: dict, token: str, when: str):
     index.setdefault('page_proposal_cooldowns', {})[token] = when
 
 
+def _yaml_from_llm(text: str | None):
+    """Извлекает YAML-документ из ответа LLM (устойчиво к ```-фенсам).
+
+    deepseek-модели часто оборачивают YAML в ```yaml … ```; пробуем распарсить
+    целиком, затем содержимое фенс-блока, затем текст без маркеров фенсов.
+    Возвращает распарсенный объект или None.
+    """
+    if not text:
+        return None
+
+    def _load(raw: str):
+        if not raw or not raw.strip():
+            return None
+        try:
+            return yaml.safe_load(raw)
+        except Exception:
+            return None
+
+    parsed = _load(text)
+    if parsed is not None:
+        return parsed
+
+    # Содержимое между первым открывающим и закрывающим фенс-блоком
+    start = text.find('```')
+    if start != -1:
+        rest = text[start + 3:]
+        end = rest.find('```')
+        block = rest if end == -1 else rest[:end]
+        newline = block.find('\n')
+        if newline != -1 and block[:newline].strip().lower() in ('', 'yaml', 'yml', 'json'):
+            block = block[newline + 1:]
+        parsed = _load(block)
+        if parsed is not None:
+            return parsed
+
+    # Последний запасной вариант — просто убрать маркеры фенсов
+    cleaned = text.replace('```yaml', '').replace('```yml', '').replace('```', '')
+    return _load(cleaned)
+
+
 def parse_page_proposal(text: str) -> dict | None:
     """Разбирает ответ LLM вида YAML {slug, title, keywords, aliases, content}.
 
     Возвращает dict с нормализованным slug и содержимым страницы; None при
     невалидном ответе.
     """
-    if not text:
-        return None
-    try:
-        data = yaml.safe_load(text)
-    except Exception:
-        return None
+    data = _yaml_from_llm(text)
     if not isinstance(data, dict):
         return None
     slug = pageio.normalize_slug(data.get('slug'))
@@ -163,12 +198,7 @@ def parse_bulk_proposal(text: str, max_pages: int) -> dict | None:
     Страницами, или None при невалидном ответе. Предельный размер содержимого
     и проверка секретов выполняются вызывающим.
     """
-    if not text:
-        return None
-    try:
-        data = yaml.safe_load(text)
-    except Exception:
-        return None
+    data = _yaml_from_llm(text)
     if not isinstance(data, dict):
         return None
 

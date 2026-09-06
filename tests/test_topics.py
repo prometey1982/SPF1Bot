@@ -140,3 +140,30 @@ def test_parse_bulk_invalid():
     assert topics.parse_bulk_proposal('', max_pages=5) is None
     # нет ни home, ни pages
     assert topics.parse_bulk_proposal('style: |\n  # Стиль', max_pages=5) is None
+
+
+def test_parse_bulk_proposal_fenced():
+    """deepseek оборачивает YAML в ```-фенсы — парсер должен их срезать."""
+    fenced = '```yaml\n' + _BULK_YAML + '```\n'
+    p = topics.parse_bulk_proposal(fenced, max_pages=10)
+    assert p is not None
+    assert len(p['pages']) == 1
+    assert p['pages'][0]['slug'] == 'cars'
+    assert '# Сводка' in p['home']
+
+
+_PAGE_PROPOSAL = (
+    "slug: garazh\n"
+    "title: Гараж\n"
+    "keywords: [гараж, гаражи]\n"
+    "content: |\n"
+    "  # Гараж\n"
+    "  - строит гараж мечты\n"
+)
+
+
+def test_parse_page_proposal_fenced():
+    p = topics.parse_page_proposal('```yaml\n' + _PAGE_PROPOSAL + '```')
+    assert p is not None
+    assert p['slug'] == 'garazh'
+    assert 'строит гараж мечты' in p['content']

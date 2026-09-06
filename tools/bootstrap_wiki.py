@@ -104,6 +104,18 @@ def _bulk_marker(idx) -> bool:
     return idx['build_info'].get('mode') == 'bulk'
 
 
+def clear_cooldowns(user_id: int, db_path: str) -> str:
+    """Обнуляет page_proposal_cooldowns пользователя (ложные cooldown-метки)."""
+    user_dir = os.path.join(botwiki.config.wiki_dir(), str(user_id))
+    idx, _ = index_mod.ensure_index(user_dir, db_path, user_id)
+    if idx is None:
+        return f"user {user_id}: нет wiki — очищать нечего"
+    count = len(idx.get('page_proposal_cooldowns') or {})
+    idx['page_proposal_cooldowns'] = {}
+    index_mod.save_index(user_dir, idx)
+    return f"user {user_id}: очищено cooldown-меток={count}"
+
+
 async def build_for_user(wiki_manager: manager.WikiManager, user_id: int,
                          db_path: str, bulk: bool = False, chars: int = 0) -> str:
     user_dir = os.path.join(botwiki.config.wiki_dir(), str(user_id))
@@ -159,6 +171,9 @@ def main():
     ap.add_argument('--bulk', action='store_true',
                     help='офлайн bulk: один LLM-вызов на пользователя (Home+Style+темы), '
                          'крупным — чанкинг по контексту')
+    ap.add_argument('--clear-cooldowns', action='store_true',
+                    help='обнулить page_proposal_cooldowns выбранных пользователей '
+                         'перед сборкой (после ошибочных отклонений тем)')
     ap.add_argument('--yes', action='store_true', help='не спрашивать подтверждение')
     args = ap.parse_args()
 
@@ -213,6 +228,8 @@ def main():
     async def _run():
         for user_id, chars in wanted:
             try:
+                if args.clear_cooldowns:
+                    print(clear_cooldowns(user_id, db_path))
                 msg = await build_for_user(mgr, user_id, db_path,
                                            bulk=args.bulk, chars=chars)
                 print(msg)
