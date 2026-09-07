@@ -91,3 +91,28 @@ def test_clear_confirm_removes_all(tmp_path, kb_db_path):
     assert db.count_rows(kb_db_path) == 0
     # после очистки статус сообщает об отсутствии индекса
     assert 'индекса нет' in admin.status_text()
+
+
+def test_status_shows_knowledge_flag(tmp_path, kb_db_path):
+    _build_kb(tmp_path, kb_db_path)
+    text = admin.status_text()
+    assert 'bot_turns=False' in text
+    assert 'Обучение из ответов бота' in text
+
+    # включённый флаг + skip-фразы отражаются в статусе
+    _configure(tmp_path, kb_db_path)  # сброс root не нужен; показываем флаг отдельно
+    root = str(tmp_path / 'kb_root2')
+    kc.configure({'db': kb_db_path, 'bot_kb': {
+        'dir': root, 'knowledge': {'bot_turns': True,
+                                   'bot_turn_skip_phrases': ['спасибо']}}})
+    idx = index_mod.new_index()
+    idx['pages'] = [
+        _page_entry('Home', 'О боте', 'self'),
+        _page_entry('Style', 'Стиль', 'self'),
+    ]
+    assert index_mod.save_index(root, idx) is True
+    pageio.write_page('Home', '# О боте\n\n', root)
+    pageio.write_page('Style', '# Стиль\n\n', root)
+    text = admin.status_text()
+    assert 'bot_turns=True' in text
+    assert 'skip-фраз: 1' in text

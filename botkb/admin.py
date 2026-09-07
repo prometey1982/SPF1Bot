@@ -49,11 +49,18 @@ def status_text() -> str:
         f"last_update: {index_data.get('last_update') or '—'}",
         f"last_reconcile: {index_data.get('last_reconcile') or '—'}",
         f"last_error: {index_data.get('last_error') or '—'}",
+    ]
+    kn = config.settings().get('knowledge', {})
+    lines.append(
+        f"Обучение из ответов бота: bot_turns={kn.get('bot_turns', False)} "
+        f"(мин. длина хода {kn.get('bot_turn_min_chars', 120)}; "
+        f"skip-фраз: {len(kn.get('bot_turn_skip_phrases') or [])})")
+    lines.append(
         f"Сырьё bot_kb_raw: всего={db.count_rows(db_path)}, "
         f"human={db.count_rows(db_path, speaker='human')}, "
         f"bot={db.count_rows(db_path, speaker='bot')}, "
         f"необработанных={db.count_unprocessed(db_path, watermark)}",
-    ]
+    )
     lines.append("Страницы:")
     if not index_data.get('pages'):
         lines.append("  (нет)")

@@ -263,6 +263,14 @@ bot_kb:
     page_max_raw_chars: 30000     # лимит подокна на одну страницу
     max_pages_per_reconcile: 10
 
+  # Обучение тематики знаний по ответам бота (ТЗ docs/bot_kb_knowledge_tz.md).
+  # Выключено по умолчанию; при включении ответы бота (ходы на вопросы людей)
+  # становятся материалом для knowledge-инкремента, детектора тем и reconcile.
+  knowledge:
+    bot_turns: false              # учить тематику по ответам бота
+    bot_turn_min_chars: 120       # суммарная длина кусков хода ≥ порога
+    bot_turn_skip_phrases: []     # фраза в куске (подстрока) → кусок исключается
+
   router:
     mode: keywords               # keywords | llm (MVP: keywords)
     min_score: 0.3
