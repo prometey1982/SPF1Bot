@@ -595,3 +595,30 @@ def test_two_bot_turns_create_topic(tmp_path):
     assert any(p['slug'] == 'turbo' and p['kind'] == 'knowledge'
                for p in idx['pages'])
     assert pageio.page_exists('turbo', root)
+
+
+# --- K3: reconcile по объединённому окну; авто-цикл требует человеческие строки ---
+
+def test_reconcile_auto_skipped_without_human_material(tmp_path, kb_db_path):
+    db_path = kb_db_path
+    root, mgr = _setup_with_knowledge(tmp_path, db_path, bot_turns=True)
+    fake = FakeLLM(response='# Выхлоп\n\n- тезис после сверки')
+    mgr.set_llm_caller(fake)
+    run(mgr.run_updates())  # bootstrap: фреймы
+    _add_knowledge_page(root, db_path)
+    # вопрос о кофе (не релевантен vyhlop), ответ бота — про противодавление
+    _seed(db_path, [
+        _row(1, content='люблю кофе по утрам с бутербродом'),
+        _row(2, speaker='bot', reply=1, content=_BOT_ANSWER),
+    ])
+
+    # auto: в подокне vyhlop нет человеческих строк (вопрос про кофе не совпал)
+    res = run(mgr.reconcile(slug='vyhlop', manual=False))
+    assert res['success'] is True
+    assert fake.calls == 0
+    assert 'тезис после сверки' not in (pageio.read_page('vyhlop', root) or '')
+
+    # ручной reconcile выполняется всегда и обновляет страницу
+    res = run(mgr.reconcile(slug='vyhlop', manual=True))
+    assert res['success'] is True and res['updated'] >= 1
+    assert 'тезис после сверки' in pageio.read_page('vyhlop', root)

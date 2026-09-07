@@ -780,8 +780,18 @@ class KBManager:
         window_rows = db.fetch_window_rows(
             db_path, int(reconcile_cfg.get('window_messages', 400)))
         human_window = [r for r in window_rows if r.get('speaker') == 'human']
+        # Объединённый пул для reconcile (bot_kb_knowledge_tz.md, K3): при флаге
+        # в пул входят и подходящие куски-бот ходов окна; иначе — только люди.
+        kn = settings.get('knowledge', {})
+        trivial_min = int(settings.get('update', {}).get('trivial_min_chars', 3))
+        if kn.get('bot_turns', False):
+            bot_rows = [r for r in window_rows if r.get('speaker') == 'bot']
+            kept, _parents, _turns = self._bot_material_for_snapshot(bot_rows, trivial_min)
+            knowledge_pool = list(human_window) + list(kept)
+        else:
+            knowledge_pool = list(human_window)
         w_tokens: set[str] = set()
-        for r in human_window:
+        for r in knowledge_pool:
             w_tokens |= textutil.token_set(r.get('content'))
 
         candidates: list[dict] = []
@@ -830,10 +840,16 @@ class KBManager:
             target = self._target_chars(page_slug, 'self' if is_service else 'knowledge',
                                         pages_cfg)
             kind = 'self' if is_service else 'knowledge'
-            subwindow, ts_from, ts_to = self._build_subwindow(
-                page, window_rows if is_service else human_window,
+            subwindow, ts_from, ts_to, human_in_sub = self._build_subwindow(
+                page, window_rows if is_service else knowledge_pool,
                 int(reconcile_cfg.get('page_max_raw_chars', 30000)),
                 kind)
+            # Н3 (bot_kb_knowledge_tz.md): auto/внеплановый reconcile без
+            # человеческих строк в подокне страницы пропускается (эхо-защита).
+            if not manual and human_in_sub == 0:
+                logger.info("bot_kb reconcile skipped: no human material (%s)",
+                            page_slug)
+                continue
             current_md = pageio.read_page(page_slug, root) or ''
             if kind == 'self':
                 prompt_text = prompts.build_reconcile_self_prompt(
@@ -958,8 +974,9 @@ class KBManager:
                          kind: str):
         """Подокно строк для страницы (релевантные её keywords/aliases — п. 9.6).
 
-        Возвращает (block|'', ts_from|None, ts_to|None) — строки не более
-        max_chars, самое свежее сверху.
+        Возвращает (block|'', ts_from|None, ts_to|None, human_count) — строки
+        не более max_chars, самое свежее сверху; human_count — число
+        человеческих строк в подокне (для правила Н3).
         """
         if kind == 'knowledge':
             page_tokens = (set(textutil.token_set(' '.join(page.get('keywords') or [])))
@@ -988,8 +1005,9 @@ class KBManager:
         block = "".join(
             f"[{r['id']}][{r.get('speaker') or 'human'}] {(r.get('content') or '').strip()}\n"
             for r in sorted(picked, key=lambda r: r['id'])).rstrip()
+        human_count = sum(1 for r in picked if r.get('speaker') == 'human')
         ts = [r.get('ts') for r in picked if r.get('ts')]
-        return block, (ts[0] if ts else None), (ts[-1] if ts else None)
+        return block, (ts[0] if ts else None), (ts[-1] if ts else None), human_count
 
     # --- обратная связь и блок диалогов (п. 9.3.3) ---
 
