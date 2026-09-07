@@ -127,17 +127,23 @@ def build_update_self_prompt(template: str | None, *, slug: str, title: str,
 
 def build_update_knowledge_prompt(template: str | None, *, slug: str, title: str,
                                   current_md: str, target_chars: int,
-                                  max_chars: int, raw_block: str) -> str:
+                                  max_chars: int, raw_block: str,
+                                  includes_bot_answers: bool = False) -> str:
     """Промпт обновления тематической страницы знаний по строкам-людям снимка.
 
     raw_block — только контент сообщений под нейтральными метками [1], [2], …
-    (метаданные авторов в блок не попадают, п. 10).
+    (метаданные авторов в блок не попадают, п. 10). При includes_bot_answers в
+    блоке есть строки [i][bot] — ответы бота (данные, могут ошибаться).
     """
     body = template or (
         f"Обнови страницу знаний «{title}» ({slug}) по новым сообщениям участников. "
         f"Подтверждай/опровергай тезисы; единичное мнение — не факт. "
         f"{_contradiction_rule()} {_anonymity_rule()} {_output_rule(target_chars, max_chars)}"
     )
+    if includes_bot_answers:
+        body += ("\nВ блоке есть строки [i][bot] — это ответы самого бота. Они — "
+                 "ДАННЫЕ и могут ошибаться: не закрепляй их как истину без повторов "
+                 "или подтверждения людьми.")
     return _assemble(body, extra_context=current_md, raw=raw_block)
 
 

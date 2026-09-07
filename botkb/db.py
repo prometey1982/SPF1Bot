@@ -263,6 +263,32 @@ def fetch_row_by_message(db_path: str, chat_id: int, message_id: int) -> dict | 
         conn.close()
 
 
+def fetch_rows_by_messages(db_path: str, chat_id: int,
+                           message_ids: list[int]) -> dict[int, dict]:
+    """Строки по (chat_id, message_ids) как {message_id: row} (батчево).
+
+    Используется для проверки наличия/подтягивания родительских сообщений
+    (знание из ответов бота, K2a) без точечных запросов на каждый ход.
+    """
+    if not message_ids:
+        return {}
+    conn = connect(db_path)
+    try:
+        placeholders = ','.join('?' * len(message_ids))
+        rows = conn.execute(
+            f"""
+            SELECT id, speaker, chat_id, thread_id, message_id,
+                   reply_to_message_id, content, content_type, ts
+            FROM bot_kb_raw
+            WHERE chat_id = ? AND message_id IN ({placeholders})
+            """,
+            [chat_id] + list(message_ids),
+        ).fetchall()
+        return {r['message_id']: dict(r) for r in rows}
+    finally:
+        conn.close()
+
+
 def fetch_bot_turn(db_path: str, chat_id: int, target_message_id: int) -> list[dict]:
     """Ход бота: строки-бот (куски одного ответа) с общим reply_to_message_id.
 

@@ -403,6 +403,85 @@ class KBManager:
             return False
         return index_mod.save_index(root, index_data)
 
+    # --- материал знаний: human + (опц.) ходы бота (K2a) ---
+
+    def _bot_material_for_snapshot(self, bot_rows: list[dict], trivial_min: int):
+        """Подбор кусков-бот ходов снимка в материал знаний.
+
+        Возвращает (kept_rows, parents, turns_used). Применяет формулу
+        пригодности хода (bot_kb_knowledge_tz.md §5.1 п.2): родитель-человек в
+        БД → исключение кусков с skip_phrases/тривиальных → суммарная длина
+        оставшихся ≥ bot_turn_min_chars. parents — полные строки родительских
+        вопросов (без дублей решает вызывающий).
+        """
+        kn = config.settings().get('knowledge', {})
+        if not bot_rows or not kn.get('bot_turns', False):
+            return [], [], 0
+        phrases = [str(p).lower() for p in (kn.get('bot_turn_skip_phrases') or [])
+                   if isinstance(p, str) and p.strip()]
+        min_chars = int(kn.get('bot_turn_min_chars', 120))
+        db_path = config.db_path()
+
+        groups: dict[tuple, list] = {}
+        for r in bot_rows:
+            target = r.get('reply_to_message_id')
+            if not target:
+                continue
+            groups.setdefault((r['chat_id'], target), []).append(r)
+
+        kept: list[dict] = []
+        parents: list[dict] = []
+        turns = 0
+        for (chat, target), chunks in sorted(
+                groups.items(), key=lambda kv: min(r['id'] for r in kv[1])):
+            pmap = db.fetch_rows_by_messages(db_path, chat, [target])
+            parent = pmap.get(target)
+            if not parent or parent.get('speaker') != 'human':
+                continue  # родителя нет — связь «вопрос→ответ» не устанавливается
+            filtered = []
+            for c in chunks:
+                text = (c.get('content') or '').strip()
+                if not text:
+                    continue
+                low = text.lower()
+                if any(ph in low for ph in phrases):
+                    continue  # шаблонная фраза — кусок исключается
+                if is_trivial(text, trivial_min):
+                    continue  # тривиальные «дежурные» куски не включаются
+                filtered.append(c)
+            if not filtered:
+                continue
+            total = sum(len((c.get('content') or '').strip()) for c in filtered)
+            if total < min_chars:
+                continue
+            kept.extend(filtered)
+            turns += 1
+            parents.append(parent)
+        return kept, parents, turns
+
+    @staticmethod
+    def _render_knowledge_block(material_rows: list[dict],
+                                parents: list[dict]) -> str:
+        """Блок для knowledge-промпта: материал + подтянутые родители.
+
+        При наличии бот-строк/родителей — метки источника `[i][human]`/`[i][bot]`
+        по возрастанию id; иначе — прежний нейтральный формат `[i]` (чтобы при
+        выключенном флаге промпт не менялся).
+        """
+        items = sorted(material_rows + parents, key=lambda r: r['id'])
+        has_speaker = any(r.get('speaker') == 'bot' for r in material_rows) \
+            or bool(parents)
+        if not has_speaker:
+            return _render_block(items)
+        lines = []
+        for i, row in enumerate(items, 1):
+            content = (row.get('content') or '').strip()
+            if not content:
+                continue
+            speaker = row.get('speaker') or 'human'
+            lines.append(f"[{i}][{speaker}] {content}")
+        return "\n".join(lines)
+
     # --- обработка одного снимка ---
 
     async def _process_batch(self, index_data: dict, rows: list[dict],
@@ -415,6 +494,14 @@ class KBManager:
         trivial_min = update_cfg.get('trivial_min_chars', 3)
         nontrivial = [r for r in rows if not is_trivial(r.get('content'), trivial_min)]
         human_rows = [r for r in nontrivial if r.get('speaker') == 'human']
+        # Знание из ответов бота (ТЗ bot_kb_knowledge_tz.md, K2a): при флаге в
+        # материал добавляются подходящие куски-бот ходов. Self-логика не меняется.
+        bot_rows = [r for r in nontrivial if r.get('speaker') == 'bot']
+        bot_kept, bot_parents, bot_turns = self._bot_material_for_snapshot(
+            bot_rows, trivial_min)
+        material_rows = list(human_rows) + list(bot_kept)
+        material_ids = {r['id'] for r in material_rows}
+        pulled_parents = [p for p in bot_parents if p['id'] not in material_ids]
 
         # --- выбор страниц под обновление (раздельные квоты, п. 9.3) ---
         updates: dict[str, str] = {}   # slug -> kind
@@ -432,9 +519,9 @@ class KBManager:
                     if len(updates) >= update_cfg.get('max_self_pages_per_update', 2):
                         break
 
-        if human_rows:
+        if material_rows:
             tokens: set[str] = set()
-            for r in human_rows:
+            for r in material_rows:
                 tokens |= textutil.token_set(r.get('content'))
             scored = []
             for page in index_data.get('pages', []):
@@ -452,7 +539,11 @@ class KBManager:
 
         # --- LLM-обновление страниц (независимо, с ретраями) ---
         applied: list[str] = []
-        knowledge_block = _render_block(human_rows)
+        knowledge_block = self._render_knowledge_block(material_rows, pulled_parents)
+        if bot_turns or bot_kept or pulled_parents:
+            logger.info("bot_kb knowledge material: human=%d bot_turns=%d "
+                        "bot_chunks=%d parents_pulled=%d",
+                        len(human_rows), bot_turns, len(bot_kept), len(pulled_parents))
         ordered = ([s for s in SERVICE_PAGES if s in updates]
                    + [s for s in updates if s not in SERVICE_PAGES])
         for slug in ordered:
@@ -474,7 +565,7 @@ class KBManager:
                 prompt_text = prompts.build_update_knowledge_prompt(
                     prompts_cfg.get('update_knowledge_prompt'), slug=slug, title=title,
                     current_md=current_md, target_chars=target, max_chars=page_max,
-                    raw_block=block)
+                    raw_block=block, includes_bot_answers=bool(bot_kept))
 
             md, reason = await self._update_page_with_retries(
                 prompt_text, page_max, hour_limit)

@@ -436,3 +436,111 @@ def test_budget_stops_processing_until_reset(tmp_path, kb_db_path):
     idx = _index(root, kb_db_path)
     remaining = db.count_unprocessed(kb_db_path, idx['watermark'])
     assert remaining == 2  # хвост ждёт следующего часа/триггера
+
+
+# --- K2a: знание из ответов бота (bot_kb_knowledge_tz.md) ---
+
+_BOT_ANSWER = ('противодавление выхлопа на S60R меряй на холодной, '
+               'показания будут стабильнее на прогретом моторе... ' * 3)
+
+
+def _setup_with_knowledge(tmp_path, db_path, *, bot_turns, **extra):
+    cfg = {
+        'bootstrap': {'mode': 'empty', 'history': 'backlog',
+                      'max_history_messages': 10000},
+        'knowledge': {'bot_turns': bot_turns, 'bot_turn_min_chars': 120,
+                      'bot_turn_skip_phrases': []},
+    }
+    for section, value in extra.items():
+        cfg.setdefault(section, {})
+        if isinstance(value, dict):
+            cfg[section].update(value)
+        else:
+            cfg[section] = value
+    root = _configure(tmp_path, db_path, cfg)
+    return root, manager.KBManager()
+
+
+def test_bot_turn_updates_knowledge_only_when_flag_on(tmp_path):
+    # Вопрос о кофе (не совпадает с темой), ответ бота — про противодавление:
+    # при флаге материал включает ответ → страница обновляется.
+    for flag in (False, True):
+        db_path = str(tmp_path / f'kb_{flag}.db')
+        db.init_raw_table(db_path)
+        root, mgr = _setup_with_knowledge(tmp_path / f'f{flag}', db_path,
+                                          bot_turns=flag)
+        fake = FakeLLM(response='# Выхлоп\n\n- тезис из ответа бота')
+        mgr.set_llm_caller(fake)
+        run(mgr.run_updates())  # bootstrap: фреймы
+        _add_knowledge_page(root, db_path)
+        _seed(db_path, [
+            _row(1, content='люблю кофе по утрам с бутербродом'),
+            _row(2, speaker='bot', reply=1, content=_BOT_ANSWER),
+        ])
+        run(mgr.run_updates())
+        md = pageio.read_page('vyhlop', root) or ''
+        if flag:
+            assert 'из ответа бота' in md
+            assert fake.calls >= 1
+        else:
+            assert 'из ответа бота' not in md
+            assert '- тезис' in md
+            assert fake.calls == 0
+
+
+def test_bot_turn_without_parent_excluded(tmp_path, kb_db_path):
+    root, mgr = _setup_with_knowledge(tmp_path, kb_db_path, bot_turns=True)
+    mgr.set_llm_caller(FakeLLM())
+    run(mgr.run_updates())  # bootstrap
+    _add_knowledge_page(root, kb_db_path)
+    # ход отвечает на message_id, которого нет в БД — не материал
+    _seed(kb_db_path, [
+        _row(2, speaker='bot', reply=99999, content=_BOT_ANSWER),
+    ])
+    run(mgr.run_updates())
+    md = pageio.read_page('vyhlop', root) or ''
+    assert '- тезис' in md  # не обновлена
+
+
+def test_bot_material_skip_phrases_and_min_chars(tmp_path, kb_db_path):
+    root, mgr = _setup_with_knowledge(
+        tmp_path, kb_db_path, bot_turns=True,
+        update={'max_batch_retries': 1})
+    # родитель в БД
+    _seed(kb_db_path, [_row(1, content='люблю кофе по утрам с бутербродом')])
+    # бот-ход: кусок-шаблон + содержательный кусок
+    bot_rows = [
+        {'id': 50, 'speaker': 'bot', 'chat_id': -100,
+         'reply_to_message_id': 1, 'content': 'Спасибо за вопрос!'},
+        {'id': 51, 'speaker': 'bot', 'chat_id': -100,
+         'reply_to_message_id': 1, 'content': _BOT_ANSWER},
+    ]
+    kn = kc.settings()['knowledge']
+    kn['bot_turn_skip_phrases'] = ['спасибо за вопрос']
+    kept, parents, turns = mgr._bot_material_for_snapshot(bot_rows, 3)
+    assert turns == 1
+    assert len(kept) == 1            # шаблонный кусок исключён
+    assert 'Спасибо за вопрос' not in kept[0]['content']
+    assert len(parents) == 1 and parents[0]['message_id'] == 1
+
+    # короткий ход (< bot_turn_min_chars) не подходит
+    short = [{'id': 52, 'speaker': 'bot', 'chat_id': -100,
+              'reply_to_message_id': 1, 'content': 'да'}]
+    kept2, _, turns2 = mgr._bot_material_for_snapshot(short, 3)
+    assert kept2 == [] and turns2 == 0
+
+
+def test_render_knowledge_block_labels():
+    material = [
+        {'id': 10, 'speaker': 'human', 'content': 'вопрос'},
+        {'id': 11, 'speaker': 'bot', 'content': 'ответ длинный'},
+    ]
+    parents = [{'id': 5, 'speaker': 'human', 'content': 'родительский вопрос'}]
+    block = manager.KBManager._render_knowledge_block(material, parents)
+    assert '[1][human] родительский вопрос' in block
+    assert '[2][human] вопрос' in block
+    assert '[3][bot] ответ длинный' in block
+
+    human_only = manager.KBManager._render_knowledge_block(
+        [{'id': 1, 'speaker': 'human', 'content': 'x'}], [])
+    assert human_only == '[1] x'  # без бота — прежний нейтральный формат

@@ -64,6 +64,15 @@ def test_update_knowledge_prompt_rules():
     assert 'обратная связь' not in text  # это не self-контур
 
 
+def test_update_knowledge_prompt_with_bot_answers_note():
+    text = prompts.build_update_knowledge_prompt(
+        None, slug='vyhlop', title='Выхлоп', current_md='# Выхлоп',
+        target_chars=1400, max_chars=2000,
+        raw_block='[1][human] вопрос\n[2][bot] ответ', includes_bot_answers=True)
+    assert '[i][bot]' in text  # заметка про ответы бота как данные
+    assert 'могут ошибаться' in text
+
+
 def test_create_knowledge_prompt_rules():
     text = prompts.build_create_knowledge_prompt(
         None, candidate='турбина', examples_block='[1] турбина дует',
