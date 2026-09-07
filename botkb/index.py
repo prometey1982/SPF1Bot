@@ -294,8 +294,8 @@ def ensure_index(root: str | None = None, db_path: str | None = None):
         logger.info("bot_kb index: пересбор по файлам: %s", errors)
         return rebuild_from_files(root, db_path), 'rebuilt'
 
-    logger.warning("bot_kb index: нет ни индекса, ни бэкапа, ни страниц: %s",
-                   errors or bak_errors)
+    logger.info("bot_kb index: индекса нет (bootstrap ещё не выполнен): %s",
+                errors or bak_errors)
     return None, 'missing'
 
 
