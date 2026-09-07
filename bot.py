@@ -611,23 +611,49 @@ async def get_openai_compatible_response(ai_config, messages, provider_name, tem
             return f"API ключ для {cfg['error_name']} не настроен"
 
         temp = temperature if temperature is not None else ai_config.get('temperature', cfg['default_temp'])
+        # Бюджет вывода. Для deepseek-reasoner max_tokens тратится и на reasoning:
+        # при длинном запросе маленький бюджет даёт пустой content (см. ниже),
+        # поэтому разумно ставить заметно больше (напр. 8000).
+        max_tokens = ai_config.get('max_tokens', 2000)
         data = cfg.get('build_data')(ai_config, messages, temp) if 'build_data' in cfg else {
             "model": cfg['model'],
             "messages": messages,
             "temperature": temp,
-            "max_tokens": 2000,
+            "max_tokens": max_tokens,
             "stream": False,
         }
 
         response = await make_async_request(cfg['url'], cfg['headers'](ai_config), data)
 
-        if response.status_code == 200:
-            result = response.json()
-            if 'parse_response' in cfg:
-                return cfg['parse_response'](result)
-            return result['choices'][0]['message']['content']
-        else:
+        if response.status_code != 200:
             return f"Ошибка {cfg['error_name']} API: {response.status_code} - {response.text}"
+
+        result = response.json()
+        if 'parse_response' in cfg:
+            return cfg['parse_response'](result)
+
+        content = (result['choices'][0]['message'].get('content') or "").strip()
+
+        # deepseek-reasoner тратит весь max_tokens на reasoning_content и при
+        # длинном запросе возвращает пустой content (см. _setup_wiki_manager).
+        # Повторяем тот же запрос на chat-модели, чтобы ответ не терялся молча.
+        if provider_name == 'deepseek' and not content:
+            fallback_model = ai_config.get('deepseek_chat_model', 'deepseek-chat')
+            logger.info("deepseek-reasoner вернул пустой content, фолбэк на %s", fallback_model)
+            data['model'] = fallback_model
+            data['max_tokens'] = max(data.get('max_tokens', 0), 4000)
+            try:
+                retry = await make_async_request(cfg['url'], cfg['headers'](ai_config), data)
+            except Exception as e:
+                return f"Ошибка при запросе к {cfg['error_name']} (фолбэк): {str(e)}"
+            if retry.status_code == 200:
+                content = (retry.json()['choices'][0]['message'].get('content') or "").strip()
+            else:
+                return f"Ошибка {cfg['error_name']} API (фолбэк): {retry.status_code} - {retry.text}"
+
+        if not content:
+            return f"Ошибка {cfg['error_name']} API: пустой ответ"
+        return content
     except Exception as e:
         return f"Ошибка при запросе к {cfg['error_name']}: {str(e)}"
 
@@ -886,6 +912,9 @@ async def handle_message(update: Update, context):
             message_text, bot_username, chat_id,
             user_name=user.first_name, user_id=user.id, user_username=user.username or ""
         )
+        if not (ai_response or "").strip():
+            logger.warning("Пустой ответ LLM: provider/chat_id игнорируется, сообщение не отправлено, chat_id=%d", chat_id)
+            return
         chat_context.add_message(chat_id, "assistant", ai_response)
         await send_long_message(update, ai_response, parse_mode='Markdown')
     else:

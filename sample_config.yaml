@@ -202,6 +202,9 @@ ai:
   backoff: 5
   max_backoff: 60
   temperature: 1.3
+  # Бюджет токенов ответа LLM. Для deepseek-reasoner max_tokens уходит и на
+  # reasoning: маленький бюджет -> пустой content на длинных запросах.
+  max_tokens: 8000
 
   # Системный промпт с учетом контекста
   system_prompt: |
