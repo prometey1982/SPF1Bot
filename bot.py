@@ -1177,11 +1177,12 @@ def main():
             .token(token)
             .request(custom_request)
             .get_updates_request(custom_request)
+            .post_init(_start_periodic_raw_cleanup)
             .build()
         )
         logger.info("Бот запущен с прокси: %s", proxy_list)
     else:
-        application = Application.builder().token(token).build()
+        application = Application.builder().token(token).post_init(_start_periodic_raw_cleanup).build()
 
     cleanup_mentions()
 
@@ -1193,7 +1194,6 @@ def main():
         _run_raw_cleanup()
     except Exception as e:
         logger.warning("Ошибка стартовой чистки user_raw: %s", e)
-    application.create_task(_periodic_raw_cleanup())
 
     # Обработчики сообщений
     application.add_handler(MessageHandler(
@@ -1235,6 +1235,11 @@ def _run_raw_cleanup():
     db_path = botwiki.config.db_path()
     watermarks = botwiki.index.discover_watermarks(db_path)
     return botwiki.retention.cleanup_processed_raw(db_path, watermarks)
+
+
+async def _start_periodic_raw_cleanup(application):
+    """Запускает периодическую чистку user_raw после старта event loop (post_init)."""
+    application.create_task(_periodic_raw_cleanup())
 
 
 async def _periodic_raw_cleanup():
