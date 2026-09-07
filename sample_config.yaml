@@ -192,6 +192,120 @@ wiki:
     merge_page_prompt: ""
 
 
+# Долговременная база знаний бота (ТЗ docs/bot_kb_tz.md).
+# Секция необязательна: без неё используются значения по умолчанию (ниже).
+# enabled: false эквивалентно mode: disabled (приоритет над mode).
+# БЗ — единая глобальная wiki инстанса (не по чатам/пользователям).
+bot_kb:
+  enabled: true
+  dir: wiki/bot_kb
+  mode: primary               # disabled | capture_only | shadow | primary
+  llm_model: deepseek-chat    # модель для генерации при provider=deepseek
+                              # (не reasoner: у него content пустой)
+
+  capture:
+    include_text: true
+    include_captions: true
+    include_bot_answers: true     # писать ответы бота (speaker='bot'), по куску на сообщение
+    include_service_messages: false
+    include_bot_commands: false
+    max_content_chars: 4000
+    redact: true                     # маска phone/email при захвате
+    redact_patterns: [phone, email]
+
+  update:
+    respond_only: false           # учиться и без ответа бота (по любому сырью)
+    self_update_on_feedback: true # Home/Style обновлять по репликам людей на ходы бота
+    debounce_seconds: 20
+    min_interval_seconds: 60
+    max_self_pages_per_update: 2  # квота self-страниц (Home/Style) за батч
+    max_pages_per_update: 3       # квота тематических (knowledge) за батч
+    self_context_turns: 3         # максимум ходов в self-блоке из обработанного окна
+    max_raw_messages_per_update: 50
+    max_raw_chars_per_update: 20000
+    skip_trivial_messages: true
+    trivial_min_chars: 3
+    max_batch_retries: 3
+    max_persistent_batch_failures: 3   # батчей подряд без успешной страницы
+    max_backoff_seconds: 600
+    page_quarantine_failures: 5
+    pause_cooldown_minutes: 30
+    on_persistent_failure: pause     # pause | retry_later | drop_old
+
+  pages:
+    start: [Home, Style]
+    max_page_chars: 2400
+    home_target_chars: 900
+    style_target_chars: 700
+    knowledge_target_chars: 1400
+    create_repeats: 3             # порог повторов темы для кандидата
+    create_window_messages: 100
+    create_cooldown_hours: 24
+    max_cooldown_entries: 100
+    max_count: 30
+    slug_pattern: "^[a-z0-9_-]{1,64}$"
+    archive_after_days: 90
+
+  bootstrap:
+    mode: from_system_prompt      # from_system_prompt | limited_window | empty
+    history: discard              # discard | backlog — судьба накопленного сырья
+    max_history_messages: 500     # при history: backlog — размер хвоста под инкременты
+    limited_window_messages: 80
+    max_seed_chars: 12000
+    seed: ""                      # опциональный операторский текст «о боте»
+
+  reconcile:
+    every_n_messages: 150
+    retry_after_minutes: 60
+    stale_fact_days: 60           # < archive_after_days (90)
+    window_messages: 400
+    max_raw_chars: 120000
+    page_max_raw_chars: 30000     # лимит подокна на одну страницу
+    max_pages_per_reconcile: 10
+
+  router:
+    mode: keywords               # keywords | llm (MVP: keywords)
+    min_score: 0.3
+    top_k: 3
+    llm_close_score_delta: 0.1
+    llm_timeout_ms: 800
+
+  inject:
+    max_chars: 4000
+    reserve_home_style_chars: 1600
+    home_max_chars: 900
+    style_max_chars: 700
+    page_max_chars: 1500
+    include_home: true
+    include_style: true
+    combined_warn_factor: 0.9     # порог = доля × сумма inject.max_chars БЗ+user-wiki (0 = выкл)
+
+  raw:
+    ttl_hours: 720                # окно сырья для reconcile (30 дней), по ts
+    no_kb_ttl_hours: 720          # строки без индекса / в capture_only (по ts)
+    max_rows: 10000               # глобальный кап строк (обработанных)
+    delete_only_processed: true
+    delete_unprocessed_without_kb: true
+
+  budgets:
+    max_updates_per_day: 60
+    max_llm_calls_per_hour: 12
+    reconcile_llm_calls_per_day: 30
+    allow_manual_reconcile_over_budget: true
+    over_limit_policy: delay       # delay | drop_old
+    max_backlog_rows: 5000         # порог непокрытых строк
+
+  prompts:
+    bootstrap_home_prompt: ""
+    bootstrap_style_prompt: ""
+    update_self_prompt: ""         # Home или Style (slug/title в шаблоне)
+    update_knowledge_prompt: ""
+    create_knowledge_prompt: ""
+    reconcile_self_prompt: ""
+    reconcile_knowledge_prompt: ""
+    merge_page_prompt: ""
+
+
 # Настройки нейросети
 ai:
   provider: "deepseek"

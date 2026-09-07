@@ -11,6 +11,7 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters
 from telegram.request import BaseRequest, HTTPXRequest
 
 import botwiki
+import botkb
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
 logger = logging.getLogger(__name__)
@@ -199,6 +200,10 @@ config = load_config()
 # даёт боту стартовать молча (валидация ТЗ user_wiki_tz.md, п. 5.2).
 botwiki.configure(config)
 
+# bot_kb-конфигурация (ТЗ bot_kb_tz.md, п. 5.3): та же схема — невалидная
+# секция `bot_kb:` не стартует молча.
+botkb.configure(config)
+
 
 # --- Database ---
 
@@ -231,6 +236,9 @@ def init_db():
     ''')
     # Сырьё для wiki пользователя (ТЗ user_wiki_tz.md, п. 7.1)
     for statement in botwiki.db.USER_RAW_DDL:
+        conn.execute(statement)
+    # Сырьё для БЗ бота (ТЗ bot_kb_tz.md, п. 7.1)
+    for statement in botkb.db.BOT_KB_RAW_DDL:
         conn.execute(statement)
     conn.commit()
     conn.close()
@@ -674,7 +682,7 @@ def _is_in_capture_scope(update: Update) -> bool:
     return user is not None and user.username in config.get('allowed_private_users', [])
 
 
-def _try_capture_raw(message, content: str, content_type: str):
+def _try_capture_wiki_raw(message, content: str, content_type: str):
     """Захват одного текста/caption в user_raw. Никогда не бросает исключений.
 
     Вызывается в горячем пути ответа: дешёвый синхронный INSERT OR IGNORE,
@@ -708,6 +716,50 @@ def _try_capture_raw(message, content: str, content_type: str):
             botwiki.db.append_raw(botwiki.config.db_path(), row)
     except Exception as e:
         logger.warning("Ошибка захвата raw (%s): %s", content_type, e)
+
+
+def _try_capture_botkb_raw(message, content: str, content_type: str):
+    """Захват одного текста/caption в bot_kb_raw (ТЗ bot_kb_tz.md, п. 9.1).
+
+    Параллельный захват с user_raw: одно сообщение участника пишется в обе
+    таблицы двумя отдельными INSERT'ами (п. 6.3). Никогда не бросает исключений.
+    """
+    try:
+        if not botkb.config.capture_active():
+            return
+        kb_cfg = botkb.settings()
+        capture_cfg = kb_cfg.get('capture', {})
+        include_key = 'include_captions' if content_type == 'caption' else 'include_text'
+        if not capture_cfg.get(include_key, True):
+            return
+
+        user = message.from_user
+        if user is None or user.id is None:
+            return
+        row = botkb.capture.build_human_row(
+            capture_cfg,
+            user_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            chat_id=message.chat_id,
+            thread_id=getattr(message, 'message_thread_id', None),
+            message_id=message.message_id,
+            reply_to_message_id=getattr(message, 'reply_to_message_id', None),
+            content=content,
+            content_type=content_type,
+            ts=getattr(message, 'date', None),
+        )
+        if row:
+            botkb.db.append_raw(botkb.config.db_path(), row)
+    except Exception as e:
+        logger.warning("Ошибка захвата bot_kb_raw (%s): %s", content_type, e)
+
+
+def _try_capture_raw(message, content: str, content_type: str):
+    """Захват текста/caption в сырьё обеих фич (wiki и bot_kb). Не бросает."""
+    _try_capture_wiki_raw(message, content, content_type)
+    _try_capture_botkb_raw(message, content, content_type)
 
 
 def _build_memory_message(user_id: int, query: str | None = None):
@@ -957,6 +1009,7 @@ async def reload_config_command(update: Update, context):
         global config
         config = load_config()
         botwiki.configure(config)  # невалидная секция wiki: ❌, конфиг не применяется
+        botkb.configure(config)    # невалидная секция bot_kb: ❌, конфиг не применяется
         await send_long_message(update, "✅ Конфигурация перезагружена!", parse_mode='Markdown')
     except Exception as e:
         await send_long_message(update, f"❌ Ошибка: {str(e)}", parse_mode='Markdown')
@@ -1255,15 +1308,21 @@ def main():
 
 
 def _run_raw_cleanup():
-    """Стартовая/периодическая чистка user_raw (ТЗ п. 7.1).
+    """Стартовая/периодическая чистка user_raw и bot_kb_raw.
 
     Wiki-пользователи определяются по восстановимому индексу (п. 2.8/7.1):
     их строки удаляются только после обработки (по watermark), у остальных —
-    no-wiki-политика, чтобы user_raw не рос бесконечно.
+    no-wiki-политика, чтобы user_raw не рос бесконечно. У bot_kb_raw пока нет
+    индекса (этап 2) — работает no-kb-политика (ТЗ bot_kb_tz.md, п. 7.3).
     """
     db_path = botwiki.config.db_path()
     watermarks = botwiki.index.discover_watermarks(db_path)
-    return botwiki.retention.cleanup_processed_raw(db_path, watermarks)
+    summary = botwiki.retention.cleanup_processed_raw(db_path, watermarks)
+    try:
+        botkb.retention.cleanup_processed_raw(botkb.config.db_path())
+    except Exception as e:
+        logger.warning("Ошибка стартовой/периодической чистки bot_kb_raw: %s", e)
+    return summary
 
 
 async def _start_periodic_raw_cleanup(application):
