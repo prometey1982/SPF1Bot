@@ -18,6 +18,7 @@ from . import topics as topics
 from . import router as router
 from . import inject as inject
 from . import manager as manager
+from . import admin as admin
 
 configure = config.configure
 settings = config.settings

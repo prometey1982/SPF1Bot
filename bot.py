@@ -1307,6 +1307,64 @@ async def clear_wiki_command(update: Update, context):
     logger.info("clear_wiki: admin=%s user_id=%d", update.message.from_user.username, user_id)
 
 
+# --- Команды БЗ бота /kb_* (ТЗ bot_kb_tz.md, п. 13) ---
+
+async def kb_status_command(update: Update, context):
+    if not is_admin(update.message.from_user):
+        return
+    await _wiki_send(update, botkb.admin.status_text())
+    logger.info("kb_status: admin=%s", update.message.from_user.username)
+
+
+async def kb_show_command(update: Update, context):
+    if not is_admin(update.message.from_user):
+        return
+    await _wiki_send(update, botkb.admin.show_text())
+
+
+async def kb_show_page_command(update: Update, context):
+    if not is_admin(update.message.from_user):
+        return
+    args = context.args if context.args else []
+    if len(args) < 1:
+        await _wiki_send(update, "Использование: /kb_show_page <slug>")
+        return
+    await _wiki_send(update, botkb.admin.show_page_text(args[0]))
+
+
+async def kb_reconcile_command(update: Update, context):
+    if not is_admin(update.message.from_user):
+        return
+    args = context.args if context.args else []
+    slug = args[0] if args else None
+    text = await botkb.admin.reconcile_text(slug)
+    await _wiki_send(update, text)
+    logger.info("kb_reconcile: admin=%s slug=%s", update.message.from_user.username, slug)
+
+
+async def kb_merge_command(update: Update, context):
+    if not is_admin(update.message.from_user):
+        return
+    args = context.args if context.args else []
+    if len(args) < 2:
+        await _wiki_send(update, "Использование: /kb_merge <slug1> <slug2>")
+        return
+    text = await botkb.admin.merge_text(args[0], args[1])
+    await _wiki_send(update, text)
+    logger.info("kb_merge: admin=%s %s <- %s", update.message.from_user.username, args[0], args[1])
+
+
+async def kb_clear_command(update: Update, context):
+    if not is_admin(update.message.from_user):
+        return
+    args = context.args if context.args else []
+    confirm = bool(args) and args[0] == 'confirm'
+    text = botkb.admin.clear_text(confirm)
+    await _wiki_send(update, text)
+    if confirm:
+        logger.info("kb_clear: admin=%s", update.message.from_user.username)
+
+
 async def import_export_command(update: Update, context):
     """Импорт истории из экспорта Telegram (ТЗ п. 9.8, 13)."""
     if not is_admin(update.message.from_user):
@@ -1481,6 +1539,13 @@ def main():
     application.add_handler(CommandHandler("clear_wiki", clear_wiki_command, filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("import_export", import_export_command, filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("import_status", import_status_command, filters.ChatType.PRIVATE))
+    # БЗ бота (/kb_*, ТЗ bot_kb_tz.md, п. 13) — admin, private
+    application.add_handler(CommandHandler("kb_status", kb_status_command, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("kb_show", kb_show_command, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("kb_show_page", kb_show_page_command, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("kb_reconcile", kb_reconcile_command, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("kb_merge", kb_merge_command, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("kb_clear", kb_clear_command, filters.ChatType.PRIVATE))
 
     logger.info("Бот запущен с поддержкой контекста!")
     application.run_polling()

@@ -742,6 +742,66 @@ class KBManager:
                 'message': f'Reconcile выполнен: обновлено страниц={updated}, '
                            f'архивировано={len(archive_slugs)}.'}
 
+    async def merge_pages(self, slug1: str, slug2: str) -> dict:
+        """Слияние страниц знаний slug2 → slug1 (п. 13). Возвращает {'ok', 'message'}."""
+        settings = config.settings()
+        pages_cfg = settings.get('pages', {})
+        prompts_cfg = settings.get('prompts', {})
+        page_max = pages_cfg.get('max_page_chars', 2400)
+        root = pageio.kb_root()
+        db_path = config.db_path()
+        index_data, _ = index_mod.ensure_index(root, db_path)
+        if index_data is None:
+            return {'ok': False, 'message': 'Нет валидного индекса БЗ (bootstrap ещё не выполнен).'}
+        if slug1 == slug2:
+            return {'ok': False, 'message': 'Страницы должны различаться.'}
+        if slug1 in SERVICE_PAGES or slug2 in SERVICE_PAGES:
+            return {'ok': False, 'message': 'self-страницы (Home/Style) не сливаются.'}
+        if not (pageio.is_safe_slug(slug1) and pageio.is_safe_slug(slug2)):
+            return {'ok': False, 'message': 'Небезопасный slug.'}
+
+        page1 = index_mod.find_page(index_data, slug1)
+        page2 = index_mod.find_page(index_data, slug2)
+        if page1 is None or page2 is None:
+            return {'ok': False, 'message': 'Одна из страниц не найдена.'}
+        if page1.get('kind') != 'knowledge' or page2.get('kind') != 'knowledge':
+            return {'ok': False, 'message': 'Сливать можно только тематические страницы (kind=knowledge).'}
+        md1 = pageio.read_page(slug1, root) or ''
+        md2 = pageio.read_page(slug2, root) or ''
+
+        prompt_text = prompts.build_merge_page_prompt(
+            prompts_cfg.get('merge_page_prompt'),
+            target_slug=slug1, target_title=page1.get('title', slug1), target_md=md1,
+            source_slug=slug2, source_title=page2.get('title', slug2), source_md=md2,
+            max_chars=page_max)
+        budgets_cfg = settings.get('budgets', {})
+        merged, reason = await self._update_page_with_retries(
+            prompt_text, page_max, budgets_cfg.get('max_llm_calls_per_hour', 12))
+        if merged is None:
+            return {'ok': False, 'message': f'Невалидный ответ LLM при слиянии ({reason}).'}
+
+        now = _now_iso()
+        page1['status'] = 'active'
+        page1['updated'] = now
+        page1['last_seen'] = now
+        page1['title'] = page1.get('title') or slug1
+        for key in ('keywords', 'aliases'):
+            merged_list = []
+            seen = set()
+            for item in list(page1.get(key, [])) + list(page2.get(key, [])):
+                if item and item not in seen:
+                    seen.add(item)
+                    merged_list.append(item)
+            page1[key] = merged_list
+        page2['status'] = 'archived'
+
+        if not (pageio.write_page(slug1, merged, root)
+                and index_mod.save_index(root, index_data)):
+            return {'ok': False, 'message': 'Ошибка записи при слиянии (изменения не применены).'}
+        logger.info("bot_kb merge: %s <- %s", slug1, slug2)
+        return {'ok': True,
+                'message': f'Страница {slug2} влита в {slug1}; {slug2} архивирована.'}
+
     def _build_subwindow(self, page: dict, rows: list[dict], max_chars: int,
                          kind: str):
         """Подокно строк для страницы (релевантные её keywords/aliases — п. 9.6).

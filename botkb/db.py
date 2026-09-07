@@ -333,3 +333,14 @@ def tail_watermark(db_path: str, keep_newest: int) -> int:
         conn.close()
 
 
+def delete_all_rows(db_path: str) -> int:
+    """Удаляет все строки bot_kb_raw (/kb_clear). Возвращает число удалённых."""
+    conn = connect(db_path)
+    try:
+        cursor = conn.execute("DELETE FROM bot_kb_raw")
+        conn.commit()
+        return cursor.rowcount or 0
+    finally:
+        conn.close()
+
+

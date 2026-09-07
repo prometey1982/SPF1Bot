@@ -225,3 +225,20 @@ def build_reconcile_self_prompt(template: str | None, *, slug: str, title: str,
     text = _assemble(body, extra_context=current_md,
                      raw=window_block or "(свежих сообщений нет)")
     return f"{text}\n\n{note}" if note else text
+
+
+def build_merge_page_prompt(template: str | None, *, target_slug: str,
+                            target_title: str, target_md: str, source_slug: str,
+                            source_title: str, source_md: str, max_chars: int) -> str:
+    """Промпт ручного слияния страниц (п. 13): контент slug2 вливается в slug1."""
+    body = template or (
+        f"Слей две страницы знаний БЗ: целевую «{target_title}» ({target_slug}) "
+        f"и исходную «{source_title}» ({source_slug}). Верни ТОЛЬКО новый markdown "
+        f"целевой страницы целиком, объединив тезисы без дублей, компактно "
+        f"(не более {max_chars} символов). {_anonymity_rule()}"
+    ).format(target_slug=target_slug, target_title=target_title,
+             source_slug=source_slug, source_title=source_title,
+             max_chars=max_chars)
+    source_block = _wrap_data(f"### Исходная страница ({source_slug})\n{source_md}")
+    return _assemble(body, extra_context=f"### Текущая страница ({target_slug})\n{target_md}",
+                     raw=source_block)
