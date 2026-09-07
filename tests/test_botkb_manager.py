@@ -278,3 +278,72 @@ def test_multichunk_bot_turn_trivial_last_chunk(tmp_path, kb_db_path):
     assert idx['watermark'] == _max_id(kb_db_path)
     assert idx['message_count'] == 3
     assert fake.calls == 0  # фидбека нет — self не обновляется, LLM не тратится
+
+
+# --- Reconcile (п. 9.6) ---
+
+def test_reconcile_manual_clears_error_and_updates(tmp_path, kb_db_path):
+    root = _configure(tmp_path, kb_db_path, {
+        'bootstrap': {'mode': 'empty', 'history': 'backlog',
+                      'max_history_messages': 10000},
+        'update': {'max_batch_retries': 1},
+    })
+    mgr = manager.KBManager()
+    mgr.set_llm_caller(FakeLLM(fail=True))
+    run(mgr.run_updates())  # bootstrap: фреймы
+    _add_knowledge_page(root, kb_db_path)
+    _seed(kb_db_path, [_row(1, content='противодавление завышено')])
+    run(mgr.run_updates())  # инкремент падает → last_error на странице
+
+    idx = _index(root, kb_db_path)
+    page = index_mod.find_page(idx, 'vyhlop')
+    assert page is not None and page['last_error']
+    assert page['failure_count'] and page['failure_count'] >= 1
+
+    # Ручной reconcile (успешный LLM) снимает ошибку и обновляет страницу
+    mgr.set_llm_caller(FakeLLM(response='# Выхлоп\n\n- тезис подтверждён окном'))
+    res = run(mgr.reconcile(slug='vyhlop', manual=True))
+    assert res['success'] is True and res['updated'] >= 1
+    idx = _index(root, kb_db_path)
+    page = index_mod.find_page(idx, 'vyhlop')
+    assert page['last_error'] is None
+    assert page['quarantined'] is False
+    assert page['failure_count'] == 0
+    assert 'подтверждён' in pageio.read_page('vyhlop', root)
+
+
+def test_quarantine_after_repeated_failures(tmp_path, kb_db_path):
+    root = _configure(tmp_path, kb_db_path, {
+        'bootstrap': {'mode': 'empty', 'history': 'backlog',
+                      'max_history_messages': 10000},
+        'update': {'page_quarantine_failures': 2, 'max_batch_retries': 1},
+    })
+    mgr = manager.KBManager()
+    mgr.set_llm_caller(FakeLLM(fail=True))
+    run(mgr.run_updates())  # bootstrap: фреймы
+    _add_knowledge_page(root, kb_db_path)
+    _seed(kb_db_path, [_row(1, content='противодавление завышено')])
+    run(mgr.run_updates())  # инкремент (+авто-reconcile) → 2 неудачи подряд
+
+    idx = _index(root, kb_db_path)
+    page = index_mod.find_page(idx, 'vyhlop')
+    assert page['quarantined'] is True
+
+    # Карантинная страница больше не ретраится автоматически
+    before = pageio.read_page('vyhlop', root)
+    mgr.set_llm_caller(FakeLLM(response='# Выхлоп\n\n- свежий тезис'))
+    _seed(kb_db_path, [_row(2, content='опять противодавление врут')])
+    run(mgr.run_updates())
+    idx = _index(root, kb_db_path)
+    page = index_mod.find_page(idx, 'vyhlop')
+    assert page['quarantined'] is True
+    assert pageio.read_page('vyhlop', root) == before
+
+    # Ручной /kb_reconcile снимает карантин и ретраит
+    res = run(mgr.reconcile(slug='vyhlop', manual=True))
+    assert res['success'] is True
+    idx = _index(root, kb_db_path)
+    page = index_mod.find_page(idx, 'vyhlop')
+    assert page['quarantined'] is False
+    assert page['last_error'] is None
+    assert 'свежий тезис' in pageio.read_page('vyhlop', root)

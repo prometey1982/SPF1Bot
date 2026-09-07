@@ -52,6 +52,34 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
 
 
+def _parse_ts(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _age_minutes(ts) -> int:
+    parsed = _parse_ts(ts)
+    if parsed is None:
+        return 10 ** 9  # непонятная дата → считаем «давно»
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return max(int((now - parsed).total_seconds() // 60), 0)
+
+
+def _older_than_days(ts, days: int) -> bool:
+    parsed = _parse_ts(ts)
+    if parsed is None:
+        return False
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return (now - parsed).total_seconds() / 86400 >= days
+
+
 def _process_page_md(raw, page_max: int):
     """Валидирует ответ LLM для страницы → (markdown|None, причина|None).
 
@@ -80,6 +108,7 @@ class _Budget:
     def __init__(self):
         self._day: tuple[str, int] | None = None
         self._hour: tuple[int, int] | None = None
+        self._rec_day: tuple[str, int] | None = None
 
     @staticmethod
     def _day_key() -> str:
@@ -114,6 +143,21 @@ class _Budget:
             self._hour = (bucket, count)
         else:
             self._hour = (bucket, self._hour[1] + count)
+
+    def can_reconcile(self, day_limit: int) -> bool:
+        if day_limit <= 0:
+            return False
+        bucket = self._day_key()
+        if self._rec_day is None or self._rec_day[0] != bucket:
+            return True
+        return self._rec_day[1] < day_limit
+
+    def consume_reconcile(self):
+        bucket = self._day_key()
+        if self._rec_day is None or self._rec_day[0] != bucket:
+            self._rec_day = (bucket, 1)
+        else:
+            self._rec_day = (bucket, self._rec_day[1] + 1)
 
 
 class KBManager:
@@ -214,11 +258,15 @@ class KBManager:
                                         max_chars=max_chars)
             if not rows:
                 # Снимок пуст → окно разобрано: детерминированное создание темы
-                # (по обработанным строкам) и выход.
+                # (по обработанным строкам), затем авто/внеплановый reconcile.
                 try:
                     await self._maybe_create_topic(index_data, pages_cfg)
                 except Exception as e:
                     logger.warning("bot_kb: ошибка создания темы: %s", e)
+                try:
+                    await self.maybe_auto_reconcile()
+                except Exception as e:
+                    logger.warning("bot_kb: ошибка авто-reconcile: %s", e)
                 return
 
             if not self.budget.can_update(budgets_cfg.get('max_updates_per_day', 60)) \
@@ -378,7 +426,8 @@ class KBManager:
                     if len(updates) >= len(SERVICE_PAGES):
                         break
                     page = index_mod.find_page(index_data, slug)
-                    if page is not None and page.get('status') == 'active':
+                    if page is not None and page.get('status') == 'active' \
+                            and not page.get('quarantined'):
                         updates[slug] = 'self'
                     if len(updates) >= update_cfg.get('max_self_pages_per_update', 2):
                         break
@@ -391,6 +440,8 @@ class KBManager:
             for page in index_data.get('pages', []):
                 if page.get('status') != 'active' or page.get('kind') == 'self':
                     continue
+                if page.get('quarantined'):
+                    continue  # карантин: страница не ретраится автоматически (п. 9.2)
                 score = router.score_query(tokens, page)
                 if score > 0:
                     scored.append((score, page.get('slug')))
@@ -429,19 +480,18 @@ class KBManager:
                 prompt_text, page_max, hour_limit)
             if md is None:
                 if reason and page is not None:
-                    page['last_error'] = reason
-                    logger.warning("bot_kb: страница %s: %s", slug, reason)
+                    self._note_page_failure(page, reason)
                 continue
             if not pageio.write_page(slug, md, pageio.kb_root()):
                 if page is not None:
-                    page['last_error'] = 'ошибка записи файла страницы'
+                    self._note_page_failure(page, 'ошибка записи файла страницы')
                 logger.warning("bot_kb: не удалось записать страницу %s", slug)
                 continue
             applied.append(slug)
             if page is not None:
                 page['updated'] = _now_iso()
                 page['last_seen'] = page['updated']
-                page['last_error'] = None
+                self._clear_page_failure(page)
 
         # Порядок записи п. 8: страницы → индекс; watermark = MAX(id) снимка
         # продвигается в любом случае (успех/сбой отдельных страниц).
@@ -485,6 +535,249 @@ class KBManager:
         if slug == 'Style':
             return pages_cfg.get('style_target_chars', 700)
         return pages_cfg.get('knowledge_target_chars', 1400)
+
+    # --- сбой страницы и карантин (п. 9.2, ревью 3.3.5) ---
+
+    def _note_page_failure(self, page: dict, reason: str):
+        """Фиксирует неудачу страницы: last_error + счётчик подряд + карантин."""
+        threshold = int(config.settings().get('update', {})
+                        .get('page_quarantine_failures', 5))
+        page['last_error'] = reason
+        page['failure_count'] = int(page.get('failure_count') or 0) + 1
+        if not page.get('quarantined') and page['failure_count'] >= threshold:
+            page['quarantined'] = True
+            logger.warning("bot_kb: страница %s ушла в карантин (неудач подряд=%d)",
+                           page.get('slug'), page['failure_count'])
+        else:
+            logger.warning("bot_kb: страница %s: %s (неудач подряд=%d)",
+                           page.get('slug'), reason, page['failure_count'])
+
+    @staticmethod
+    def _clear_page_failure(page: dict):
+        page['last_error'] = None
+        page['failure_count'] = 0
+        page['quarantined'] = False
+
+    # --- reconcile (п. 9.6) ---
+
+    async def maybe_auto_reconcile(self) -> bool:
+        """Авто/внеплановый reconcile по правилам п. 9.6. Вызывается из drain.
+
+        Авто — по message_count >= every_n_messages; внеплановый — при страницах
+        с last_error и истечении retry_after_minutes с последнего reconcile.
+        """
+        if not self._enabled_for_updates():
+            return False
+        root = pageio.kb_root()
+        db_path = config.db_path()
+        index_data, _ = index_mod.ensure_index(root, db_path)
+        if index_data is None:
+            return False
+        settings = config.settings()
+        reconcile_cfg = settings.get('reconcile', {})
+
+        has_errors = any(p.get('last_error') for p in index_data.get('pages', [])
+                         if p.get('status') == 'active')
+        due = False
+        reason = ''
+        if int(index_data.get('message_count', 0)) >= int(reconcile_cfg.get('every_n_messages', 150)):
+            due, reason = True, 'авто'
+        if has_errors and self._unplanned_due(index_data, reconcile_cfg):
+            due, reason = True, 'внеплановый (last_error)'
+        if not due:
+            return False
+        res = await self.reconcile(manual=False, reason=reason)
+        return bool(res.get('updated'))
+
+    def _unplanned_due(self, index_data: dict, reconcile_cfg: dict) -> bool:
+        last_ts = index_data.get('last_reconcile')
+        if not last_ts:
+            return True
+        retry_min = int(reconcile_cfg.get('retry_after_minutes', 60))
+        return _age_minutes(last_ts) >= retry_min
+
+    async def reconcile(self, slug: str | None = None, manual: bool = False,
+                        reason: str = 'ручной') -> dict:
+        """Reconcile: сверка страниц с окном raw, суженным под страницу (п. 9.6).
+
+        manual: ручная команда (/kb_reconcile) — снимает карантин указанных/всех
+        страниц и пропускает дневной reconcile-бюджет при allow_manual_*.
+        Возвращает {'success', 'updated', 'partial', 'message'}.
+        """
+        settings = config.settings()
+        reconcile_cfg = settings.get('reconcile', {})
+        pages_cfg = settings.get('pages', {})
+        budgets_cfg = settings.get('budgets', {})
+        root = pageio.kb_root()
+        db_path = config.db_path()
+        page_max = pages_cfg.get('max_page_chars', 2400)
+        hour_limit = budgets_cfg.get('max_llm_calls_per_hour', 12)
+
+        index_data, _ = index_mod.ensure_index(root, db_path)
+        if index_data is None:
+            return {'success': False, 'updated': 0, 'partial': False,
+                    'message': 'Нет валидного индекса БЗ (bootstrap ещё не выполнен).'}
+
+        rec_day = int(budgets_cfg.get('reconcile_llm_calls_per_day', 30))
+        allow_over = bool(budgets_cfg.get('allow_manual_reconcile_over_budget', True))
+        if not self.budget.can_reconcile(rec_day):
+            if not (manual and allow_over):
+                return {'success': False, 'updated': 0, 'partial': False,
+                        'message': 'Дневной лимит reconcile исчерпан.'}
+
+        window_rows = db.fetch_window_rows(
+            db_path, int(reconcile_cfg.get('window_messages', 400)))
+        human_window = [r for r in window_rows if r.get('speaker') == 'human']
+        w_tokens: set[str] = set()
+        for r in human_window:
+            w_tokens |= textutil.token_set(r.get('content'))
+
+        candidates: list[dict] = []
+        archive_slugs: list[str] = []
+        if slug is not None:
+            page = index_mod.find_page(index_data, slug)
+            if page is None:
+                return {'success': False, 'updated': 0, 'partial': False,
+                        'message': f'Страница «{slug}» не найдена.'}
+            candidates = [page]
+        else:
+            for page in index_data.get('pages', []):
+                if page.get('status') != 'active':
+                    continue
+                is_service = page.get('slug') in SERVICE_PAGES
+                q = page.get('quarantined')
+                if is_service:
+                    if q and not manual:
+                        continue
+                    candidates.append(page)
+                    continue
+                if q and not manual:
+                    continue
+                relevant = bool(w_tokens and router.score_query(w_tokens, page) > 0)
+                if page.get('last_error') or relevant or manual:
+                    candidates.append(page)
+                elif not relevant and _older_than_days(
+                        page.get('last_seen') or page.get('updated'),
+                        int(pages_cfg.get('archive_after_days', 90))):
+                    archive_slugs.append(page.get('slug'))  # спящая тема (без LLM)
+
+        cap = int(reconcile_cfg.get('max_pages_per_reconcile', 10))
+        partial = len(candidates) > cap
+        chosen = candidates[:cap]
+
+        # Ручной reconcile снимает карантин/ошибки у выбранных страниц (п. 9.6/13)
+        if manual:
+            for page in chosen:
+                self._clear_page_failure(page)
+
+        updated = 0
+        prompts_cfg = settings.get('prompts', {})
+        for page in chosen:
+            page_slug = page.get('slug')
+            is_service = page_slug in SERVICE_PAGES
+            target = self._target_chars(page_slug, 'self' if is_service else 'knowledge',
+                                        pages_cfg)
+            kind = 'self' if is_service else 'knowledge'
+            subwindow, ts_from, ts_to = self._build_subwindow(
+                page, window_rows if is_service else human_window,
+                int(reconcile_cfg.get('page_max_raw_chars', 30000)),
+                kind)
+            current_md = pageio.read_page(page_slug, root) or ''
+            if kind == 'self':
+                prompt_text = prompts.build_reconcile_self_prompt(
+                    prompts_cfg.get('reconcile_self_prompt'), slug=page_slug,
+                    title=page.get('title', page_slug), current_md=current_md,
+                    target_chars=target, max_chars=page_max, window_block=subwindow,
+                    updated=page.get('updated'), last_seen=page.get('last_seen'),
+                    window_ts_from=ts_from, window_ts_to=ts_to)
+            else:
+                prompt_text = prompts.build_reconcile_knowledge_prompt(
+                    prompts_cfg.get('reconcile_knowledge_prompt'), slug=page_slug,
+                    title=page.get('title', page_slug), current_md=current_md,
+                    target_chars=target, max_chars=page_max, window_block=subwindow,
+                    updated=page.get('updated'), last_seen=page.get('last_seen'),
+                    window_ts_from=ts_from, window_ts_to=ts_to)
+
+            md, err = await self._update_page_with_retries(prompt_text, page_max, hour_limit)
+            if md is None:
+                if err:
+                    self._note_page_failure(page, err)
+                continue
+            if not pageio.write_page(page_slug, md, root):
+                self._note_page_failure(page, 'ошибка записи файла страницы')
+                continue
+            now = _now_iso()
+            page['updated'] = now
+            page['last_seen'] = now
+            self._clear_page_failure(page)
+            updated += 1
+
+        now = _now_iso()
+        for page_slug in archive_slugs:
+            page = index_mod.find_page(index_data, page_slug)
+            if page is not None:
+                page['status'] = 'archived'
+                logger.info("bot_kb reconcile: страница %s → archived", page_slug)
+        index_data['last_update'] = now
+        if not partial:
+            index_data['message_count'] = 0
+            index_data['last_reconcile'] = now
+            if not manual or allow_over:
+                self.budget.consume_reconcile()
+        # Гасим повтор внепланового reconcile до retry_after_minutes даже при
+        # частичном сбое (иначе каждый триггер гонял бы один и тот же reconcile).
+        index_data['last_reconcile'] = now
+
+        if not index_mod.save_index(root, index_data):
+            return {'success': False, 'updated': updated, 'partial': partial,
+                    'message': 'Ошибка записи индекса при reconcile.'}
+
+        logger.info("bot_kb reconcile (%s): страниц=%d updated=%d archived=%d partial=%s",
+                    reason, len(chosen), updated, len(archive_slugs), partial)
+        if partial:
+            return {'success': False, 'updated': updated, 'partial': True,
+                    'message': f'Reconcile обработал {updated} из {len(candidates)} '
+                               'страниц; message_count не сброшен — повторите позже.'}
+        return {'success': True, 'updated': updated, 'partial': False,
+                'message': f'Reconcile выполнен: обновлено страниц={updated}, '
+                           f'архивировано={len(archive_slugs)}.'}
+
+    def _build_subwindow(self, page: dict, rows: list[dict], max_chars: int,
+                         kind: str):
+        """Подокно строк для страницы (релевантные её keywords/aliases — п. 9.6).
+
+        Возвращает (block|'', ts_from|None, ts_to|None) — строки не более
+        max_chars, самое свежее сверху.
+        """
+        if kind == 'knowledge':
+            page_tokens = (set(textutil.token_set(' '.join(page.get('keywords') or [])))
+                           | set(textutil.token_set(' '.join(page.get('aliases') or [])))
+                           | set(textutil.token_set(page.get('title') or '')))
+        else:
+            page_tokens = None
+
+        picked: list[dict] = []
+        used = 0
+        for row in reversed(rows):
+            if page_tokens is not None and not (textutil.token_set(row.get('content') or '')
+                                                & page_tokens):
+                continue
+            content = (row.get('content') or '').strip()
+            if not content:
+                continue
+            line = f"[{row['id']}][{row.get('speaker') or 'human'}] {content}\n"
+            if used + len(line) > max_chars:
+                continue
+            picked.append(row)
+            used += len(line)
+            if len(picked) >= int(config.settings().get('update', {})
+                                  .get('max_raw_messages_per_update', 50)):
+                break
+        block = "".join(
+            f"[{r['id']}][{r.get('speaker') or 'human'}] {(r.get('content') or '').strip()}\n"
+            for r in sorted(picked, key=lambda r: r['id'])).rstrip()
+        ts = [r.get('ts') for r in picked if r.get('ts')]
+        return block, (ts[0] if ts else None), (ts[-1] if ts else None)
 
     # --- обратная связь и блок диалогов (п. 9.3.3) ---
 

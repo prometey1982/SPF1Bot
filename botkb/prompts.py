@@ -166,3 +166,62 @@ def build_create_knowledge_prompt(template: str | None, *, candidate: str,
         f"{examples_block or '(нет примеров)'}"
     ).format(candidate=candidate, max_chars=max_chars)
     return f"{_common_rules()}\n\n{body}"
+
+
+def _stale_note(updated: str | None, last_seen: str | None,
+                window_ts_from: str | None, window_ts_to: str | None) -> str:
+    """Метаданные для reconcile (п. 3.3.6 ревью): возраст страницы и окна.
+
+    Помогает модели не помечать «устаревшим» то, что не подтверждено лишь из-за
+    короткого окна: сомнительное не помечать; страница last_updated/последней
+    релевантности и диапазон ts строк подокна передаются как данные.
+    """
+    parts = []
+    if last_seen:
+        parts.append(f"последняя релевантность страницы (last_seen): {last_seen}")
+    if updated:
+        parts.append(f"последнее обновление (updated): {updated}")
+    if window_ts_from and window_ts_to:
+        parts.append(f"временной диапазон строк подокна: {window_ts_from} .. {window_ts_to}")
+    if not parts:
+        return ""
+    note = ("Метаданные страницы и подокна (данные): " + "; ".join(parts) + ".\n"
+            "Сомнительное НЕ помечай устаревшим: отсутствие тезиса в свежем окне "
+            "само по себе НЕ повод его удалять.")
+    return note
+
+
+def build_reconcile_knowledge_prompt(template: str | None, *, slug: str, title: str,
+                                     current_md: str, target_chars: int,
+                                     max_chars: int, window_block: str,
+                                     updated: str | None, last_seen: str | None,
+                                     window_ts_from: str | None,
+                                     window_ts_to: str | None) -> str:
+    """Промпт reconcile тематической страницы с подокном raw (п. 9.6)."""
+    body = template or (
+        f"Сверь страницу знаний «{title}» ({slug}) с подокном сообщений ниже. "
+        "Подтверждай тезисы; не подтверждённые в течение горизонта устаревания "
+        "(stale) — сократи/переформулируй как «ранее X, теперь Y». "
+        f"{_contradiction_rule()} {_anonymity_rule()} {_output_rule(target_chars, max_chars)}"
+    )
+    note = _stale_note(updated, last_seen, window_ts_from, window_ts_to)
+    text = _assemble(body, extra_context=current_md,
+                     raw=window_block or "(свежих сообщений нет)")
+    return f"{text}\n\n{note}" if note else text
+
+
+def build_reconcile_self_prompt(template: str | None, *, slug: str, title: str,
+                                current_md: str, target_chars: int,
+                                max_chars: int, window_block: str,
+                                updated: str | None, last_seen: str | None,
+                                window_ts_from: str | None,
+                                window_ts_to: str | None) -> str:
+    """Промпт reconcile self-страницы (Home/Style) с окном raw (п. 9.6)."""
+    body = template or (
+        f"Сверь самоописание «{title}» ({slug}) с диалогами ниже. "
+        f"{_self_feedback_rule()} {_output_rule(target_chars, max_chars)}"
+    )
+    note = _stale_note(updated, last_seen, window_ts_from, window_ts_to)
+    text = _assemble(body, extra_context=current_md,
+                     raw=window_block or "(свежих сообщений нет)")
+    return f"{text}\n\n{note}" if note else text
