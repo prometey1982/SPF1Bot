@@ -246,6 +246,28 @@ def fetch_processed_human_window(db_path: str, watermark: int, limit: int) -> li
         conn.close()
 
 
+def fetch_processed_rows(db_path: str, watermark: int) -> list[dict]:
+    """Все обработанные строки (id <= watermark), human и bot, по id.
+
+    Исходные строки для нормализации окна детектора в «сообщения-материал»
+    (ход бота = 1 единица, K2b); выбор ограничен схемой topic-окна.
+    """
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, speaker, chat_id, message_id, reply_to_message_id,
+                   content, content_type FROM bot_kb_raw
+            WHERE id <= ?
+            ORDER BY id ASC
+            """,
+            (watermark,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def fetch_row_by_message(db_path: str, chat_id: int, message_id: int) -> dict | None:
     """Строку по (chat_id, message_id) — любую (human/bot). None — нет."""
     conn = connect(db_path)

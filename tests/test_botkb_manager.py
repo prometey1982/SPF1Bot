@@ -544,3 +544,54 @@ def test_render_knowledge_block_labels():
     human_only = manager.KBManager._render_knowledge_block(
         [{'id': 1, 'speaker': 'human', 'content': 'x'}], [])
     assert human_only == '[1] x'  # без бота — прежний нейтральный формат
+
+
+# --- K2b: детектор тем по «сообщениям-материалу» (ход = 1) ---
+
+_TURBO = 'турбина ' * 30  # длинный содержательный ход (>= min_chars)
+
+
+def test_single_multichunk_turn_does_not_create_topic(tmp_path):
+    """Один ответ из 2+ кусков с повтором токена не выполняет порог сам."""
+    db_path = str(tmp_path / 'kb.db')
+    db.init_raw_table(db_path)
+    root, mgr = _setup_with_knowledge(
+        tmp_path / 'kb', db_path, bot_turns=True,
+        pages={'create_repeats': 2})
+    mgr.set_llm_caller(FakeLLM(yaml=True))
+    run(mgr.run_updates())  # bootstrap
+    _seed(db_path, [
+        _row(1, content='люблю кофе по утрам'),
+        _row(2, speaker='bot', reply=1, content=_TURBO),
+        _row(3, speaker='bot', reply=1, content=_TURBO),  # второй кусок того же хода
+    ])
+    run(mgr.run_updates())
+
+    idx = _index(root, db_path)
+    assert not any(p['slug'] == 'turbo' for p in idx['pages'])
+    # единица окна одна: человеческое сообщение + один ход = 2 единицы
+    window = mgr._processed_material_window(db_path, idx['watermark'], 100)
+    assert len(window) == 2
+
+
+def test_two_bot_turns_create_topic(tmp_path):
+    """Два РАЗНЫХ хода бота с одной темой → тема создаётся."""
+    db_path = str(tmp_path / 'kb.db')
+    db.init_raw_table(db_path)
+    root, mgr = _setup_with_knowledge(
+        tmp_path / 'kb', db_path, bot_turns=True,
+        pages={'create_repeats': 2})
+    mgr.set_llm_caller(FakeLLM(yaml=True))
+    run(mgr.run_updates())  # bootstrap
+    _seed(db_path, [
+        _row(1, content='люблю кофе по утрам'),
+        _row(2, speaker='bot', reply=1, content=_TURBO),
+        _row(3, content='снова кофе вечером'),
+        _row(4, speaker='bot', reply=3, content=_TURBO),
+    ])
+    run(mgr.run_updates())
+
+    idx = _index(root, db_path)
+    assert any(p['slug'] == 'turbo' and p['kind'] == 'knowledge'
+               for p in idx['pages'])
+    assert pageio.page_exists('turbo', root)

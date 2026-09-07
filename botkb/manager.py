@@ -459,6 +459,67 @@ class KBManager:
             parents.append(parent)
         return kept, parents, turns
 
+    def _processed_material_window(self, db_path: str, watermark: int,
+                                   limit_units: int) -> list[dict]:
+        """Окно детектора в «сообщениях-материале» (ход бота = 1 единица, K2b).
+
+        Возвращает последние `limit_units` единиц: человеческое сообщение = 1,
+        подходящий ход бота = 1 (куски склеиваются; единица получает id первого
+        куска). Применяется формула пригодности хода; шаблонные/тривиальные
+        куски в склейку не попадают.
+        """
+        rows = db.fetch_processed_rows(db_path, watermark)
+        kn = config.settings().get('knowledge', {})
+        phrases = [str(p).lower() for p in (kn.get('bot_turn_skip_phrases') or [])
+                   if isinstance(p, str) and p.strip()]
+        min_chars = int(kn.get('bot_turn_min_chars', 120))
+        trivial_min = int(config.settings().get('update', {})
+                          .get('trivial_min_chars', 3))
+
+        groups: dict[tuple, list] = {}
+        for r in rows:
+            if r.get('speaker') == 'bot' and r.get('reply_to_message_id'):
+                groups.setdefault((r['chat_id'], r['reply_to_message_id']), []).append(r)
+
+        by_chat: dict[int, set] = {}
+        for (chat, target) in groups:
+            by_chat.setdefault(chat, set()).add(target)
+        parent_exists: dict[tuple, bool] = {}
+        for chat, targets in by_chat.items():
+            found = db.fetch_rows_by_messages(db_path, chat, sorted(targets))
+            for target in targets:
+                row = found.get(target)
+                parent_exists[(chat, target)] = bool(row and row.get('speaker') == 'human')
+
+        events: list[tuple[int, str]] = []
+        for key, chunks in groups.items():
+            if not parent_exists.get(key):
+                continue
+            kept = []
+            for c in sorted(chunks, key=lambda x: x['id']):
+                text = (c.get('content') or '').strip()
+                if not text:
+                    continue
+                if any(ph in text.lower() for ph in phrases):
+                    continue
+                if is_trivial(text, trivial_min):
+                    continue
+                kept.append(text)
+            if not kept or sum(len(t) for t in kept) < min_chars:
+                continue
+            merged = '\n'.join(kept)
+            events.append((min(c['id'] for c in chunks), merged))
+
+        for r in rows:
+            if r.get('speaker') == 'human':
+                content = (r.get('content') or '').strip()
+                if content:
+                    events.append((r['id'], content))
+
+        events.sort(key=lambda x: x[0])
+        events = events[-int(limit_units):]
+        return [{'id': unit_id, 'content': content} for unit_id, content in events]
+
     @staticmethod
     def _render_knowledge_block(material_rows: list[dict],
                                 parents: list[dict]) -> str:
@@ -1028,8 +1089,12 @@ class KBManager:
         root = pageio.kb_root()
         db_path = config.db_path()
         watermark = index_data.get('watermark', 0)
-        window = db.fetch_processed_human_window(
-            db_path, watermark, pages_cfg.get('create_window_messages', 100))
+        window_units = pages_cfg.get('create_window_messages', 100)
+        kn = config.settings().get('knowledge', {})
+        if kn.get('bot_turns', False):
+            window = self._processed_material_window(db_path, watermark, window_units)
+        else:
+            window = db.fetch_processed_human_window(db_path, watermark, window_units)
         if not window:
             return False
         candidates = topics.detect_candidates(
