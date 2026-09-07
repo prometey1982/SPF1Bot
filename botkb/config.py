@@ -90,6 +90,13 @@ BOT_KB_DEFAULTS = {
         'max_pages_per_reconcile': 10,
     },
 
+    # Обучение тематики знаний по ответам бота (ТЗ docs/bot_kb_knowledge_tz.md).
+    'knowledge': {
+        'bot_turns': False,          # учить тематику по ответам бота (ходам)
+        'bot_turn_min_chars': 120,   # суммарная длина кусков хода ≥ порога
+        'bot_turn_skip_phrases': [], # фраза в куске → кусок исключается из хода
+    },
+
     'router': {
         'mode': 'keywords',          # keywords | llm
         'min_score': 0.3,
@@ -177,6 +184,7 @@ _positive_int_keys = [
     ('reconcile', 'max_raw_chars'),
     ('reconcile', 'page_max_raw_chars'),
     ('reconcile', 'max_pages_per_reconcile'),
+    ('knowledge', 'bot_turn_min_chars'),
     ('inject', 'max_chars'),
     ('inject', 'reserve_home_style_chars'),
     ('inject', 'home_max_chars'),
@@ -208,6 +216,7 @@ _bool_keys = [
     ('update', 'respond_only'),
     ('update', 'self_update_on_feedback'),
     ('update', 'skip_trivial_messages'),
+    ('knowledge', 'bot_turns'),
     ('inject', 'include_home'),
     ('inject', 'include_style'),
     ('raw', 'delete_only_processed'),
@@ -301,6 +310,12 @@ def _validate(cfg: dict) -> list[str]:
             or not (0 <= warn_factor <= 1):
         bad('inject', 'combined_warn_factor',
             f"ожидается число в [0, 1] (0 = выкл), получено {warn_factor!r}")
+
+    # knowledge.bot_turn_skip_phrases — список строк
+    skip = cfg.get('knowledge', {}).get('bot_turn_skip_phrases')
+    if skip is not None and (not isinstance(skip, list)
+                             or not all(isinstance(x, str) for x in skip)):
+        bad('knowledge', 'bot_turn_skip_phrases', 'ожидается список строк')
 
     # Алгебраические проверки (ТЗ п. 5.3)
     def n(section: str, key: str) -> int:

@@ -135,3 +135,49 @@ def test_capture_only_not_active_in_disabled():
     top = _top({'mode': 'disabled'})
     kc.configure(top)
     assert kc.capture_active() is False
+
+
+# --- Секция knowledge (ТЗ bot_kb_knowledge_tz.md, K1) ---
+
+def test_knowledge_defaults_off():
+    top = _top()
+    kc.configure(top)
+    kn = kc.settings()['knowledge']
+    assert kn['bot_turns'] is False
+    assert kn['bot_turn_min_chars'] == 120
+    assert kn['bot_turn_skip_phrases'] == []
+
+
+def test_knowledge_enabled_valid():
+    top = _top({'knowledge': {'bot_turns': True, 'bot_turn_min_chars': 200,
+                              'bot_turn_skip_phrases': ['слушай сюда']}})
+    kc.configure(top)
+    kn = kc.settings()['knowledge']
+    assert kn['bot_turns'] is True
+    assert kn['bot_turn_min_chars'] == 200
+    assert kn['bot_turn_skip_phrases'] == ['слушай сюда']
+
+
+def test_knowledge_min_chars_validated_always():
+    """Валидация bot_turn_min_chars — всегда, независимо от флага."""
+    for bad in (0, -1, '120'):
+        top = _top({'knowledge': {'bot_turn_min_chars': bad}})
+        with pytest.raises(KBConfigError):
+            kc.configure(top)
+
+
+def test_knowledge_skip_phrases_type_checked():
+    top = _top({'knowledge': {'bot_turn_skip_phrases': 'спасибо'}})
+    with pytest.raises(KBConfigError):
+        kc.configure(top)
+    top = _top({'knowledge': {'bot_turn_skip_phrases': [1, 2]}})
+    with pytest.raises(KBConfigError):
+        kc.configure(top)
+    top = _top({'knowledge': {'bot_turn_skip_phrases': ['спасибо']}})
+    kc.configure(top)  # валидно
+
+
+def test_knowledge_bot_turns_type_checked():
+    top = _top({'knowledge': {'bot_turns': 'yes'}})
+    with pytest.raises(KBConfigError):
+        kc.configure(top)
