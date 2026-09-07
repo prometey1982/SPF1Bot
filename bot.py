@@ -1312,14 +1312,18 @@ def _run_raw_cleanup():
 
     Wiki-пользователи определяются по восстановимому индексу (п. 2.8/7.1):
     их строки удаляются только после обработки (по watermark), у остальных —
-    no-wiki-политика, чтобы user_raw не рос бесконечно. У bot_kb_raw пока нет
-    индекса (этап 2) — работает no-kb-политика (ТЗ bot_kb_tz.md, п. 7.3).
+    no-wiki-политика, чтобы user_raw не рос бесконечно. У bot_kb_raw политика
+    зависит от валидного индекса (ТЗ bot_kb_tz.md, п. 7.3): есть индекс —
+    чистятся обработанные, нет — no-kb-политика.
     """
     db_path = botwiki.config.db_path()
     watermarks = botwiki.index.discover_watermarks(db_path)
     summary = botwiki.retention.cleanup_processed_raw(db_path, watermarks)
     try:
-        botkb.retention.cleanup_processed_raw(botkb.config.db_path())
+        # watermark валидного/восстановимого индекса → watermark-политика;
+        # индекса нет (страницы не созданы/capture_only) → no-kb-политика
+        wm = botkb.index.watermark_for_retention()
+        botkb.retention.cleanup_processed_raw(botkb.config.db_path(), kb_watermark=wm)
     except Exception as e:
         logger.warning("Ошибка стартовой/периодической чистки bot_kb_raw: %s", e)
     return summary

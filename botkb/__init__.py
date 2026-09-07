@@ -11,6 +11,8 @@ from . import config as config
 from . import db as db
 from . import capture as capture
 from . import retention as retention
+from . import pages as pages
+from . import index as index
 
 configure = config.configure
 settings = config.settings
