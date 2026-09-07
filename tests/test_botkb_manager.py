@@ -66,10 +66,21 @@ def _index(root, db_path):
 class FakeLLM:
     """Возвращает markdown страницы; при yaml=True — YAML-предложение темы."""
 
+    _DEFAULT_PROPOSAL = (
+        "slug: turbo\n"
+        "title: Турбины\n"
+        "keywords: [турбина]\n"
+        "aliases: []\n"
+        "content: |\n"
+        "  # Турбины\n"
+        "  - дуется после 0.5 бара\n"
+    )
+
     def __init__(self, response='# Обновление\n\n- новый тезис', yaml=False,
-                 fail=False):
+                 proposal=None, fail=False):
         self.response = response
         self.yaml = yaml
+        self.proposal = proposal if proposal is not None else self._DEFAULT_PROPOSAL
         self.fail = fail
         self.calls = 0
 
@@ -78,15 +89,7 @@ class FakeLLM:
         if self.fail:
             return 'Ошибка: что-то сломалось'
         if self.yaml and 'keywords:' in prompt:
-            return (
-                "slug: turbo\n"
-                "title: Турбины\n"
-                "keywords: [турбина]\n"
-                "aliases: []\n"
-                "content: |\n"
-                "  # Турбины\n"
-                "  - дует после 0.5 бара\n"
-            )
+            return self.proposal
         return self.response
 
 
@@ -347,3 +350,89 @@ def test_quarantine_after_repeated_failures(tmp_path, kb_db_path):
     assert page['quarantined'] is False
     assert page['last_error'] is None
     assert 'свежий тезис' in pageio.read_page('vyhlop', root)
+
+
+# --- Этап 6: негативные тесты (безопасность/достоверность) ---
+
+def test_bootstrap_secret_output_falls_back_to_frames(tmp_path, kb_db_path):
+    root = _configure(tmp_path, kb_db_path, {
+        'bootstrap': {'mode': 'from_system_prompt', 'seed': 'Описание бота'},
+    })
+    mgr = manager.KBManager()
+    fake = FakeLLM(response='# О боте\n\n- пиши на a@b.ru (секрет)')
+    mgr.set_llm_caller(fake)
+    assert run(mgr._bootstrap()) is True
+
+    assert fake.calls == 2  # Home и Style оба вернули «секрет» → отброшены
+    home = pageio.read_page('Home', root)
+    style = pageio.read_page('Style', root)
+    assert home == SELF_HOME_FRAME and style == '# Стиль\n\n'
+    assert 'a@b.ru' not in home + style
+
+
+def test_increment_rejects_secret_llm_output(tmp_path, kb_db_path):
+    root, mgr = _bootstrap_empty(tmp_path, kb_db_path)
+    mgr.set_llm_caller(FakeLLM(fail=True))
+    run(mgr.run_updates())  # bootstrap: фреймы
+    _add_knowledge_page(root, kb_db_path)
+    mgr.set_llm_caller(FakeLLM(response='# Выхлоп\n\n- password=supersecret на холодной'))
+    _seed(kb_db_path, [_row(1, content='противодавление завышено')])
+    run(mgr.run_updates())
+
+    idx = _index(root, kb_db_path)
+    page = index_mod.find_page(idx, 'vyhlop')
+    assert page['last_error']  # секретный ответ не сохранён
+    md = pageio.read_page('vyhlop', root)
+    assert 'supersecret' not in md
+    assert '- тезис' in md  # содержимое не изменилось
+
+
+def test_topic_create_rejects_secret_content(tmp_path, kb_db_path):
+    root, mgr = _bootstrap_empty(tmp_path, kb_db_path)
+    fake = FakeLLM(yaml=True, proposal=(
+        "slug: turbo\n"
+        "title: Турбины\n"
+        "keywords: [турбина]\n"
+        "aliases: []\n"
+        "content: |\n"
+        "  # Турбины\n"
+        "  - token=abcd1234 секрет\n"
+    ))
+    mgr.set_llm_caller(fake)
+    _seed(kb_db_path, [
+        _row(mid, content=f'турбина дует на {mid} передаче')
+        for mid in range(1, 6)
+    ])
+    run(mgr.run_updates())
+
+    idx = _index(root, kb_db_path)
+    assert not any(p['slug'] == 'turbo' for p in idx['pages'])  # отклонена
+    assert not pageio.page_exists('turbo', root)
+    # секрет не попал ни в одну страницу
+    for slug in pageio.list_slugs(root):
+        assert 'abcd1234' not in (pageio.read_page(slug, root) or '')
+
+
+def test_budget_stops_processing_until_reset(tmp_path, kb_db_path):
+    root = _configure(tmp_path, kb_db_path, {
+        'bootstrap': {'mode': 'empty', 'history': 'backlog',
+                      'max_history_messages': 10000},
+        'update': {'max_raw_messages_per_update': 1},
+        'budgets': {'max_llm_calls_per_hour': 1},
+    })
+    mgr = manager.KBManager()
+    fake = FakeLLM(response='# Выхлоп\n\n- тезис обновлён')
+    mgr.set_llm_caller(fake)
+    run(mgr.run_updates())  # bootstrap: фреймы
+    _add_knowledge_page(root, kb_db_path)
+    _seed(kb_db_path, [
+        _row(mid, content='противодавление завышено раз')
+        for mid in range(1, 4)
+    ])
+    run(mgr.run_updates())
+
+    # Обработан один снимок (1 llm-вызов исчерпал часовой лимит), дальше стоп
+    assert fake.calls == 1
+    idx = _index(root, kb_db_path)
+    remaining = db.count_unprocessed(kb_db_path, idx['watermark'])
+    assert remaining == 2  # хвост ждёт следующего часа/триггера
