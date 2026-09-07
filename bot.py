@@ -512,16 +512,41 @@ async def get_ai_response_with_context(message_text, bot_username, chat_id, user
     context_messages = chat_context.get_context(chat_id)
 
     # Память о пользователе (ТЗ п. 12): primary+валидная wiki → инъекция wiki;
-    # иначе — dossier-фолбэк (п. 6.2).
+    # иначе — dossier-фолбэк (п. 6.2). Хранится отдельно от истории, чтобы
+    # строго соблюсти порядок инъекций (ТЗ bot_kb_tz.md, п. 12.4).
+    extra_messages: list[dict] = []
     if user_id and config.get('use_ai', False):
         memory_msg = _build_memory_message(user_id, query=message_text)
         if memory_msg:
-            context_messages = [memory_msg] + context_messages
+            extra_messages.append(memory_msg)
 
     # Фоновая актуализация памяти о пользователе (fire-and-forget):
     # режимы wiki (ТЗ п. 6.1) решают, что обновлять — wiki, dossier или оба.
     if user_id and config.get('use_ai', False):
         _trigger_user_updates(user_id, user_username, message_text)
+
+    # Инъекция БЗ бота (ТЗ bot_kb_tz.md, п. 12.1/12.4): отдельное system-сообщение
+    # после памяти пользователя (ближе к истории). Своя конфиг-секция и лимиты.
+    if config.get('use_ai', False):
+        botkb_msg = _build_botkb_memory_message(message_text)
+        if botkb_msg:
+            extra_messages.append(botkb_msg)
+
+    # Runtime-warning суммарной инъекции (память пользователя + БЗ) по
+    # combined_warn_factor (п. 12.4): порог = доля × сумма inject.max_chars секций.
+    try:
+        combined = sum(len(m.get('content') or '') for m in extra_messages)
+        warn_factor = botkb.settings().get('inject', {}).get('combined_warn_factor', 0.9)
+        if warn_factor and combined > 0:
+            threshold = warn_factor * (
+                botkb.settings().get('inject', {}).get('max_chars', 4000)
+                + botwiki.settings().get('inject', {}).get('max_chars', 3000))
+            if combined > threshold:
+                logger.warning("Суммарная инъекция (память+БЗ) %d > порог %.0f "
+                               "(combined_warn_factor=%.2f)", combined, threshold,
+                               warn_factor)
+    except Exception as e:
+        logger.warning("Ошибка оценки суммарной инъекции: %s", e)
 
     # Формируем messages для LLM
     system_prompt = ai_config.get('system_prompt', 'Ты полезный ассистент. Отвечай на русском.')
@@ -529,12 +554,15 @@ async def get_ai_response_with_context(message_text, bot_username, chat_id, user
 
     if provider in PROVIDER_CONFIGS:
         # Современные API — передаём историю сообщений
+        messages = messages + extra_messages
         for msg in context_messages[-15:]:
             messages.append({"role": msg["role"], "content": msg["content"]})
         result = await call_llm_raw(ai_config, messages, provider)
     else:
         # Legacy API (Llama) — собираем контекст в один текст
         context_text = ""
+        for msg in extra_messages:
+            context_text += f"Система: {msg['content']}\n"
         for msg in context_messages[-5:]:
             role = "Пользователь" if msg["role"] == "user" else "Ассистент"
             context_text += f"{role}: {msg['content']}\n"
@@ -892,6 +920,28 @@ def _build_memory_message(user_id: int, query: str | None = None):
         except Exception:
             pass
     return None
+
+
+def _build_botkb_memory_message(query: str | None = None):
+    """System-сообщение БЗ бота для ответа (ТЗ bot_kb_tz.md, п. 12).
+
+    Горячий путь: только чтение (кэш по mtime, никаких дисковых записей).
+    В primary: валидная БЗ → инъекция self+router; иначе None (без фолбэка).
+    """
+    try:
+        if botkb.config.mode() != 'primary':
+            return None
+        pages_sel = botkb.inject.select_pages_for_injection(
+            botkb.config.db_path(), query=query)
+        if not pages_sel:
+            return None
+        content = botkb.inject.build_system_message(pages_sel)
+        logger.info("bot_kb inject: страниц=%d chars=%d",
+                    len(pages_sel), sum(len(p['text']) for p in pages_sel))
+        return {"role": "system", "content": content}
+    except Exception as e:
+        logger.warning("Ошибка подготовки инъекции БЗ: %s", e)
+        return None
 
 
 def _trigger_user_updates(user_id: int, user_username: str, message_text: str):

@@ -15,6 +15,8 @@ from . import pages as pages
 from . import index as index
 from . import prompts as prompts
 from . import topics as topics
+from . import router as router
+from . import inject as inject
 from . import manager as manager
 
 configure = config.configure
