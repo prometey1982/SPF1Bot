@@ -196,3 +196,140 @@ def fetch_window_rows(db_path: str, limit: int) -> list[dict]:
         return [dict(r) for r in rows]
     finally:
         conn.close()
+
+
+def fetch_rows_until(db_path: str, upto_id: int, limit: int) -> list[dict]:
+    """Последние `limit` строк с id <= upto_id по возрастанию id.
+
+    Используется для построения блоков диалогов self (строки снимка + уже
+    обработанный хвост в пределах лимита).
+    """
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, speaker, user_id, chat_id, thread_id, message_id,
+                   reply_to_message_id, content, content_type, ts
+            FROM (
+                SELECT id, speaker, user_id, chat_id, thread_id, message_id,
+                       reply_to_message_id, content, content_type, ts
+                FROM bot_kb_raw WHERE id <= ? ORDER BY id DESC LIMIT ?
+            ) ORDER BY id ASC
+            """,
+            (upto_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def fetch_processed_human_window(db_path: str, watermark: int, limit: int) -> list[dict]:
+    """Обработанные (id <= watermark) строки-человек по возрастанию id.
+
+    Окно для создания тематических страниц (п. 9.4): знания извлекаются только
+    из сообщений участников, ответы бота в детектор не попадают.
+    """
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, speaker, chat_id, content, ts FROM (
+                SELECT id, speaker, chat_id, content, ts FROM bot_kb_raw
+                WHERE speaker = 'human' AND id <= ?
+                ORDER BY id DESC LIMIT ?
+            ) ORDER BY id ASC
+            """,
+            (watermark, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def fetch_row_by_message(db_path: str, chat_id: int, message_id: int) -> dict | None:
+    """Строку по (chat_id, message_id) — любую (human/bot). None — нет."""
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT id, speaker, chat_id, thread_id, message_id,
+                   reply_to_message_id, content, ts
+            FROM bot_kb_raw WHERE chat_id = ? AND message_id = ?
+            """,
+            (chat_id, message_id),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def fetch_bot_turn(db_path: str, chat_id: int, target_message_id: int) -> list[dict]:
+    """Ход бота: строки-бот (куски одного ответа) с общим reply_to_message_id.
+
+    Связка строго в пределах chat_id (п. 7.1/9.3.3): численное совпадение
+    reply_to_message_id из другого чата не даёт ложной связки.
+    """
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, speaker, chat_id, thread_id, message_id,
+                   reply_to_message_id, content, ts
+            FROM bot_kb_raw
+            WHERE chat_id = ? AND speaker = 'bot' AND reply_to_message_id = ?
+            ORDER BY id ASC
+            """,
+            (chat_id, target_message_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def fetch_replies_to(db_path: str, chat_id: int, message_ids: list[int]) -> list[dict]:
+    """Строки-человек, реплики на любые из message_ids (в пределах чата).
+
+    «Обратная связь» (п. 2): реплики людей на сообщения/куски бота.
+    """
+    if not message_ids:
+        return []
+    conn = connect(db_path)
+    try:
+        placeholders = ','.join('?' * len(message_ids))
+        rows = conn.execute(
+            f"""
+            SELECT id, speaker, user_id, chat_id, thread_id, message_id,
+                   reply_to_message_id, content, content_type, ts
+            FROM bot_kb_raw
+            WHERE chat_id = ? AND speaker = 'human'
+              AND reply_to_message_id IN ({placeholders})
+            ORDER BY id ASC
+            """,
+            [chat_id] + message_ids,
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def tail_watermark(db_path: str, keep_newest: int) -> int:
+    """Watermark, оставляющий непокрытыми ровно `keep_newest` самых новых строк.
+
+    Считается по ЧИСЛУ строк, а не арифметикой id (в автоинкременте возможны
+    дырки от INSERT OR IGNORE-дублей и будущего импорта, п. 9.7). Если строк
+    <= keep_newest — возвращает 0 (непокрыты все); иначе — id строки, стоящей
+    на (keep_newest+1)-й позиции от самой новой.
+    """
+    conn = connect(db_path)
+    try:
+        if keep_newest <= 0:
+            return 0
+        row = conn.execute(
+            "SELECT id FROM bot_kb_raw ORDER BY id DESC LIMIT 1 OFFSET ?",
+            (int(keep_newest),),
+        ).fetchone()
+        return row['id'] if row is not None else 0
+    finally:
+        conn.close()
+
+

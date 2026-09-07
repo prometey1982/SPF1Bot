@@ -99,30 +99,38 @@ async def send_long_message(update, message_text, parse_mode='Markdown'):
     Асинхронная отправка длинного сообщения с учетом ограничений:
     - длина одного сообщения не может превышать 4 кб
     - между сообщениями должно пройти не меньше 1 секунды
+
+    Возвращает список отправленных telegram.Message (все куски) — используется
+    для захвата ответов бота в bot_kb_raw (по строке на кусок, п. 9.1).
     """
     # Максимальная длина сообщения в байтах
     MAX_MESSAGE_LENGTH = 4096
 
     parts = split_text(message_text, MAX_MESSAGE_LENGTH)
-    
+    sent_messages = []
+
     # Отправляем все части с задержкой
     for i, part in enumerate(parts):
         # Проверяем, есть ли message_thread_id (для супергрупп и тем обсуждений)
         message_thread_id = getattr(update.message, 'message_thread_id', None)
         try:
             if message_thread_id:
-                await update.message.reply_text(part, parse_mode=parse_mode, message_thread_id=message_thread_id)
+                msg = await update.message.reply_text(part, parse_mode=parse_mode, message_thread_id=message_thread_id)
             else:
-                await update.message.reply_text(part, parse_mode=parse_mode)
+                msg = await update.message.reply_text(part, parse_mode=parse_mode)
         except Exception:
             if message_thread_id:
-                await update.message.reply_text(part, message_thread_id=message_thread_id)
+                msg = await update.message.reply_text(part, message_thread_id=message_thread_id)
             else:
-                await update.message.reply_text(part)
+                msg = await update.message.reply_text(part)
+        if msg is not None:
+            sent_messages.append(msg)
 
         # Не делаем задержку после последнего сообщения
         if i < len(parts) - 1:
             await asyncio.sleep(0.05)
+
+    return sent_messages
 
 
 # Хранилище контекста (в памяти)
@@ -762,6 +770,98 @@ def _try_capture_raw(message, content: str, content_type: str):
     _try_capture_botkb_raw(message, content, content_type)
 
 
+# --- Фоновая актуализация БЗ бота (ТЗ bot_kb_tz.md, п. 9.2, 16) ---
+
+_kb_debounce_task = None
+
+
+def _schedule_botkb_update():
+    """Отложенная постановка задачи апдейта БЗ (дебаунс, глобально).
+
+    Воркер KBManager сам сериализует обработку и соблюдает min_interval/бюджеты.
+    """
+    global _kb_debounce_task
+    try:
+        if botkb.config.mode() not in ('shadow', 'primary'):
+            return
+        if _kb_debounce_task is not None and not _kb_debounce_task.done():
+            return  # уже запланировано
+
+        async def _go():
+            debounce = botkb.settings().get('update', {}).get('debounce_seconds', 0)
+            if debounce:
+                await asyncio.sleep(debounce)
+            try:
+                botkb.kb_manager.enqueue()
+            except Exception as e:
+                logger.warning("Ошибка постановки задачи БЗ: %s", e)
+
+        _kb_debounce_task = asyncio.create_task(_go())
+    except Exception as e:
+        logger.warning("Ошибка планирования обновления БЗ: %s", e)
+
+
+def _maybe_enqueue_botkb_on_capture():
+    """Захват строки-человека → апдейт БЗ при update.respond_only: false (п. 6.2).
+
+    При respond_only: true учимся только когда бот ответил — задачу ставит
+    ветка ответа (_schedule_botkb_after_answer).
+    """
+    try:
+        if botkb.config.mode() not in ('shadow', 'primary'):
+            return
+        update_cfg = botkb.settings().get('update', {})
+        if update_cfg.get('respond_only', False):
+            return
+        _schedule_botkb_update()
+    except Exception as e:
+        logger.warning("Ошибка постановки задачи БЗ по захвату: %s", e)
+
+
+def _schedule_botkb_after_answer():
+    """После ответа бота (use_ai): всегда планируем апдейт (обучение по ходу)."""
+    try:
+        if botkb.config.mode() not in ('shadow', 'primary'):
+            return
+        _schedule_botkb_update()
+    except Exception as e:
+        logger.warning("Ошибка планирования обновления БЗ после ответа: %s", e)
+
+
+def _try_capture_botkb_answer(message, sent_messages, bot_id):
+    """Захват ответа бота в bot_kb_raw: строка-бот на каждый отправленный кусок.
+
+    Общий reply_to_message_id = id исходного сообщения (ход бота, п. 9.1/2.4).
+    Никогда не бросает исключений.
+    """
+    try:
+        if not botkb.config.capture_active():
+            return
+        kb_cfg = botkb.settings()
+        capture_cfg = kb_cfg.get('capture', {})
+        if not capture_cfg.get('include_bot_answers', True):
+            return
+        if not sent_messages:
+            return
+        reply_to = message.message_id
+        thread_id = getattr(message, 'message_thread_id', None)
+        for msg in sent_messages:
+            row = botkb.capture.build_bot_row(
+                capture_cfg,
+                bot_user_id=bot_id,
+                chat_id=message.chat_id,
+                thread_id=thread_id,
+                message_id=msg.message_id,
+                reply_to_message_id=reply_to,
+                content=getattr(msg, 'text', None),
+                ts=getattr(msg, 'date', None),
+            )
+            if row:
+                botkb.db.append_raw(botkb.config.db_path(), row)
+    except Exception as e:
+        logger.warning("Ошибка захвата ответа бота в bot_kb_raw: %s", e)
+
+
 def _build_memory_message(user_id: int, query: str | None = None):
     """System-сообщение о пользователе для ответа (wiki → dossier-фолбэк).
 
@@ -856,6 +956,28 @@ def _setup_wiki_manager():
     botwiki.wiki_manager.set_llm_caller(_wiki_llm_call)
 
 
+def _setup_botkb_manager():
+    """Внедряет LLM-caller в KBManager (провайдер/конфиг читаются на каждый вызов).
+
+    Аналогично wiki: для deepseek используется НЕ reasoning-модель (см. §15
+    bot_kb_tz.md, llm_model), иначе reasoner тратит max_tokens на reasoning.
+    """
+    async def _kb_llm_call(prompt: str):
+        ai_config = config.get('ai', {})
+        provider = ai_config.get('provider', 'deepseek')
+        temperature = config.get('dossier', {}).get('temperature', 0.1)
+
+        if provider == 'deepseek':
+            kb_llm_model = botkb.settings().get('llm_model') or 'deepseek-chat'
+            return await _call_openai_text(
+                ai_config.get('deepseek_api_key'), prompt, temperature,
+                model=kb_llm_model)
+        return await call_llm_raw(ai_config, [{"role": "user", "content": prompt}],
+                                  provider, temperature=temperature)
+
+    botkb.kb_manager.set_llm_caller(_kb_llm_call)
+
+
 async def _call_openai_text(api_key, prompt, temperature, model: str) -> str:
     """Прямой OpenAI-совместимый вызов для wiki (deepseek-chat и подобные).
 
@@ -900,6 +1022,7 @@ async def handle_caption_capture(update: Update, context):
     _try_capture_raw(message, message.caption, 'caption')
     if message.from_user is not None:
         _maybe_enqueue_wiki_on_capture(message.from_user.id)
+        _maybe_enqueue_botkb_on_capture()
 
 
 async def handle_message(update: Update, context):
@@ -930,6 +1053,7 @@ async def handle_message(update: Update, context):
     if update.message.text is not None:
         _try_capture_raw(update.message, update.message.text, 'text')
         _maybe_enqueue_wiki_on_capture(user.id)
+        _maybe_enqueue_botkb_on_capture()
 
     # Гейты реакции
     if is_group:
@@ -968,7 +1092,10 @@ async def handle_message(update: Update, context):
             logger.warning("Пустой ответ LLM: provider/chat_id игнорируется, сообщение не отправлено, chat_id=%d", chat_id)
             return
         chat_context.add_message(chat_id, "assistant", ai_response)
-        await send_long_message(update, ai_response, parse_mode='Markdown')
+        sent_messages = await send_long_message(update, ai_response, parse_mode='Markdown')
+        # Захват ответа бота в bot_kb_raw + фоновая актуализация БЗ (п. 9.1, 16)
+        _try_capture_botkb_answer(update.message, sent_messages, context.bot.id)
+        _schedule_botkb_after_answer()
     else:
         responses = config.get('responses', [])
         if responses:
@@ -1270,6 +1397,8 @@ def main():
 
     # Внедряем LLM-caller в WikiManager (общий провайдер, см. call_llm_raw)
     _setup_wiki_manager()
+    # Внедряем LLM-caller в KBManager (БЗ бота)
+    _setup_botkb_manager()
 
     # Чистка user_raw (три политики ретенции, ТЗ п. 7.1) + периодическая чистка
     try:

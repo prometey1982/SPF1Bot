@@ -205,3 +205,77 @@ def test_fetch_unprocessed_human_and_bot_rows(kb_db_path):
     snap = db.fetch_unprocessed(kb_db_path, wm)
     assert snap[0]['speaker'] == 'human'
     assert 'reply_to_message_id' in snap[0]
+
+
+def _append(db_path, *, message_id, speaker='human', chat_id=-100,
+            reply_to_message_id=None, content='x'):
+    return db.append_raw(db_path, _row(message_id=message_id, speaker=speaker,
+                                       chat_id=chat_id, content=content,
+                                       reply_to_message_id=reply_to_message_id))
+
+
+def test_fetch_rows_until(kb_db_path):
+    for mid in range(1, 6):
+        _append(kb_db_path, message_id=mid, content=f'm{mid}')
+    conn = sqlite3.connect(kb_db_path)
+    upto = conn.execute("SELECT id FROM bot_kb_raw WHERE message_id=4").fetchone()[0]
+    conn.close()
+    rows = db.fetch_rows_until(kb_db_path, upto, 3)
+    assert [r['content'] for r in rows] == ['m2', 'm3', 'm4']
+    # первые строки (старее лимита) отбрасываются
+    conn = sqlite3.connect(kb_db_path)
+    upto_all = conn.execute("SELECT MAX(id) FROM bot_kb_raw").fetchone()[0]
+    conn.close()
+    all_rows = db.fetch_rows_until(kb_db_path, upto_all, 100)
+    assert len(all_rows) == 5
+
+
+def test_fetch_processed_human_window(kb_db_path):
+    _append(kb_db_path, message_id=1, speaker='bot', content='ход')
+    _append(kb_db_path, message_id=2, speaker='human', content='чел')
+    _append(kb_db_path, message_id=3, speaker='human', content='ещё чел')
+    conn = sqlite3.connect(kb_db_path)
+    ids = {r[0]: r[1] for r in conn.execute(
+        "SELECT message_id, id FROM bot_kb_raw")}
+    conn.close()
+    wm = ids[2]  # обработаны первые две строки (bot + human)
+    window = db.fetch_processed_human_window(kb_db_path, wm, 10)
+    assert [r['content'] for r in window] == ['чел']  # только human
+
+
+def test_fetch_row_by_message(kb_db_path):
+    _append(kb_db_path, message_id=7, speaker='bot', content='ход')
+    row = db.fetch_row_by_message(kb_db_path, -100, 7)
+    assert row is not None and row['speaker'] == 'bot'
+    assert db.fetch_row_by_message(kb_db_path, -100, 999) is None
+    # численное совпадение из другого чата — не связка
+    assert db.fetch_row_by_message(kb_db_path, -99, 7) is None
+
+
+def test_fetch_bot_turn_strict_chat(kb_db_path):
+    # Ход бота в чате A: bot куски с reply_to=10 (message 100,101)
+    _append(kb_db_path, message_id=100, speaker='bot', chat_id=-100,
+            reply_to_message_id=10, content='кусок1')
+    _append(kb_db_path, message_id=101, speaker='bot', chat_id=-100,
+            reply_to_message_id=10, content='кусок2')
+    # другой чат с тем же численным reply_to — ложная связка не должна попадать
+    _append(kb_db_path, message_id=200, speaker='bot', chat_id=-99,
+            reply_to_message_id=10, content='чужой чат')
+    turn = db.fetch_bot_turn(kb_db_path, -100, 10)
+    assert [r['message_id'] for r in turn] == [100, 101]
+    turn_other = db.fetch_bot_turn(kb_db_path, -99, 10)
+    assert [r['message_id'] for r in turn_other] == [200]
+
+
+def test_fetch_replies_to(kb_db_path):
+    _append(kb_db_path, message_id=100, speaker='bot', content='кусок')
+    _append(kb_db_path, message_id=110, speaker='human', content='спасибо',
+            reply_to_message_id=100)
+    _append(kb_db_path, message_id=111, speaker='human', content='не согласен',
+            reply_to_message_id=100)
+    # реплика на не-кусок в другом чате — не попадает
+    _append(kb_db_path, message_id=120, speaker='human', chat_id=-99,
+            content='чужое', reply_to_message_id=100)
+    replies = db.fetch_replies_to(kb_db_path, -100, [100])
+    assert {r['message_id'] for r in replies} == {110, 111}
+    assert db.fetch_replies_to(kb_db_path, -100, []) == []
